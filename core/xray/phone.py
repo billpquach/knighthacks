@@ -93,11 +93,6 @@ class Phone:
         self.count = 0
         self.ref_wh = None
         self.info = {}
-        try:
-            if self.stream.get_device_type() != 1:
-                print("note: the stream isn't from the LiDAR camera (TrueDepth?): use the rear camera in Record3D")
-        except AttributeError:
-            pass
 
     def read(self, timeout=5.0):
         if self.stopped.is_set():
@@ -114,6 +109,8 @@ class Phone:
             dh, dw = depth.shape[:2]
             self.ref_wh = intrinsics_reference(K4, (w, h), (dw, dh))
             ow, oh = output_size(w, h)
+            if dw * dh < 192 * 256:                          # (the rear LiDAR gives 192 x 256 depth)
+                print(f"note: {dw}x{dh} depth is not the rear LiDAR's 192x256: is Record3D on the rear camera?")
             self.info = dict(rgb=f"{w}x{h}", depth=f"{dw}x{dh}", out=f"{ow}x{oh}",
                              intrinsics_for=f"{self.ref_wh[0]}x{self.ref_wh[1]}",
                              confidence="yes" if conf.size == depth.size else "no (depth > 0 counts as high)")

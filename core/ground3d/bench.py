@@ -290,8 +290,6 @@ def run_one(job, args, out, n, total):
                     res["nvmap_warnings"] += 1
                     if res["nvmap_warnings"] > 1:
                         continue                        # counted, printed once
-                elif re.match(r"^\s+weights \d+/\d+", ln) and not re.match(r"^\s+weights (\d+)/\1\b", ln):
-                    continue                            # one line per weights file: only the last one is shown
                 print("   | " + ln, flush=True)
                 if ln.strip() and NVMAP not in ln:
                     tail.append(ln.strip())
