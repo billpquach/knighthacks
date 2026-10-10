@@ -52,6 +52,20 @@ class ReplayViewerTests(unittest.TestCase):
                 urlopen(self.base + path)
             self.assertEqual(error.exception.code, 404)
 
+    def test_state_json_and_cors_everywhere(self):
+        with urlopen(self.base + "/state.json") as response:
+            self.assertEqual(response.headers["Content-Type"], "application/json")
+            self.assertEqual(response.headers.get_all("Access-Control-Allow-Origin"), ["*"])
+            self.assertIn("objects", json.load(response))
+        for path in ["/viewer-info", "/frame.jpg"]:
+            with urlopen(self.base + path) as response:
+                self.assertEqual(response.headers.get_all("Access-Control-Allow-Origin"), ["*"])
+        with self.assertRaises(HTTPError) as error:
+            urlopen(self.base + "/no-such-page")
+        self.assertEqual(error.exception.headers.get_all("Access-Control-Allow-Origin"), ["*"])
+        with urlopen(self.base + "/state", timeout=3) as response:
+            self.assertEqual(response.headers.get_all("Access-Control-Allow-Origin"), ["*"])
+
     def test_recorded_states_are_not_paired_with_fake_camera(self):
         original = server.STATES
         try:

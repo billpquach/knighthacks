@@ -1,7 +1,7 @@
 # Robot Live Viewer
 
-A local Three.js viewer for the Jetson's `/state` SSE stream and `/frame.jpg`
-x-ray camera feed. The default port is **8080**, defined in `replay_server.py`.
+A local Three.js viewer for the Jetson's `/state` SSE stream (or `/state.json`, the newest
+state once) and `/frame.jpg` x-ray camera feed. The default port is **8080**, defined in `replay_server.py`.
 The interface supports split view, spatial view with camera inset, and camera
 view with spatial inset. Select an object to inspect its bearing and distance;
 selection is local to the viewer and never commands the rover.
@@ -38,8 +38,9 @@ camera path are saved in browser local storage. The original Jetson server
 does not need `/viewer-info`; that optional endpoint labels local replay.
 
 The browser must reach the source over the LAN, hotspot, or Tailscale. For a
-viewer hosted on a different origin, the Jetson must allow CORS on `/state`
-and `/frame.jpg`. To read image timing headers, also send:
+viewer hosted on a different origin, the Jetson must allow CORS on `/state`,
+`/state.json` and `/frame.jpg` (the replay server allows any origin on every
+response). To read image timing headers, also send:
 
 ```text
 Access-Control-Allow-Origin: <viewer-origin>
@@ -60,7 +61,7 @@ to the latest state. The page does not save frames or recordings.
 
 ## Telemetry and geometry
 
-The existing handoff contract is supported: world coordinates in meters, z up,
+The state contract is supported: world coordinates in meters, z up,
 `camera.position`, `camera.forward` (or row-major 3x4 `T_world_cam`), `objects[]`,
 `target_id`, and `ball`, including nested `ball.balls[]`. IDs are looked up by
 value, never used as array indices. Camera pose drives the actual 3D viewpoint.
@@ -71,7 +72,7 @@ The documented original stream has object centers and sizes but **does not
 provide point clouds or scene occluders**. Without them, the viewer draws
 explicitly labeled BOUNDING BOXES. It cannot infer an unseen wall from a target's
 OCCLUDED state. The following optional, additive fields are proposed by this
-viewer and still need to be emitted by Bill's real perception server:
+viewer and still need to be emitted by the Jetson's perception server:
 
 ```json
 {

@@ -1,0 +1,16 @@
+{
+  "note": "Scans, queries and expected answers for python -m ground3d.bench. 'scan' is a scan folder written by python -m xray.scan. The first query of a case is the INIT target (its time counts toward INIT). Each case is one runner process (model load ~100 s), so put all the wordings for one scan in one case. Fill 'expect' from a run on the Jetson with --update-cases; per query (all optional): score (the same confidence band: high >= 0.5, low >= 0.3), band, min_score, center [x, y, z] in metres (within tol_cm, default 3).",
+  "cases": [
+    {
+      "name": "act1",
+      "scan": "~/knighthacks26/core/runs/scan_act1/scan",
+      "queries": [
+        "the cup closest to the can",
+        "the cup next to the can",
+        "the cup beside the can",
+        "the cup next to the ball"
+      ],
+      "expect": {}
+    }
+  ]
+}

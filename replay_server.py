@@ -1,10 +1,12 @@
 """Stand-in for the Jetson viewer, for building the glasses app and the rover without the Jetson.
 
-python replay_server.py                          # synthetic states in the contract shape
-python replay_server.py sample_state_G8.jsonl    # replay Bill's real recording at 5 Hz, looped
+python replay_server.py                                # synthetic states in the contract shape
+python replay_server.py docs/sample_state_G8.jsonl     # replay a recorded state stream at 5 Hz, looped
 
-GET /state       server-sent events, one JSON message per event (SSE)
-GET /frame.jpg   one JPEG per request, with X-Seq and X-Age-Ms headers
+GET /state        server-sent events, one JSON message per event (SSE)
+GET /state.json   the newest state, once (for clients that poll instead of streaming)
+GET /frame.jpg    one JPEG per request, with X-Seq and X-Age-Ms headers
+Every response allows any origin (CORS), so a page served from elsewhere can read all of them.
 Only needs numpy and opencv-python (already installed). Port 8080, or pass --port.
 """
 import argparse
@@ -48,13 +50,25 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def end_headers(self):
+        # CORS on every response, errors included, sent once here (a repeated Allow-Origin header is rejected)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Expose-Headers", "X-Seq, X-Age-Ms")
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         path = unquote(urlsplit(self.path).path)
         if path == "/state":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             try:
                 while True:
@@ -64,6 +78,14 @@ class H(BaseHTTPRequestHandler):
                     time.sleep(1.0 / HZ)
             except (BrokenPipeError, ConnectionResetError):
                 return
+        elif path == "/state.json":
+            body = json.dumps(state_at(int((time.time() - T0) * HZ)), separators=(",", ":")).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif path == "/frame.jpg":
             if STATES:
                 self.send_error(404, "No camera recording supplied with state-only replay")
@@ -77,8 +99,6 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("X-Seq", str(seq))
             self.send_header("X-Age-Ms", "0")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Expose-Headers", "X-Seq, X-Age-Ms")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             try:
@@ -89,7 +109,6 @@ class H(BaseHTTPRequestHandler):
             body = json.dumps({"mode": "replay" if STATES else "synthetic", "hz": HZ}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -117,7 +136,7 @@ if __name__ == "__main__":
     else:
         print("No file given, serving synthetic states")
     srv = ThreadingHTTPServer(("0.0.0.0", a.port), H)
-    print(f"Serving on http://0.0.0.0:{a.port}  (/state, /frame.jpg)")
+    print(f"Serving on http://0.0.0.0:{a.port}  (/state, /state.json, /frame.jpg)")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
