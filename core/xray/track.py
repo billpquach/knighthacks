@@ -6,8 +6,8 @@ date while they can't be seen.
     tracker.update(frame, detections)                # every frame: an xray.frames.Frame and its xray.detect Detections
     msg = tracker.message(frame)                     # the state message (the docs/sample_state_G8.jsonl shape)
 
-    python -m xray.track <track folder> --scan <scan folder> [--target-pixel U V] [--out runs/track_<name>]
-replays a recorded track folder (the scan folder layout) and writes states.jsonl, which
+    python -m xray.track <track folder> --scan <scan folder> [--ball | --target-pixel U V] [--out runs/track_<name>]
+replays a recorded track folder (--ball: with the shell game, xray.shell) (the scan folder layout) and writes states.jsonl, which
 replay_server.py --track plays back over the same recording. Detections come from the track folder's
 detections_<labels>.npz when there is one (xray.detect.detect_scan writes it), else the detector runs on each frame.
 
@@ -518,6 +518,7 @@ def main(argv=None):
     ap.add_argument("--prompt", default=rf.DEFAULT_PROMPT, help=f"detector labels (default \"{rf.DEFAULT_PROMPT}\")")
     ap.add_argument("--target-pixel", type=int, nargs=2, metavar=("U", "V"), help="the target: the object under this pixel of the first frame")
     ap.add_argument("--target-point", type=float, nargs=3, metavar=("X", "Y", "Z"), help="the target: the object nearest this world point")
+    ap.add_argument("--ball", action="store_true", help="the shell game: balls under cups (xray.shell)")
     ap.add_argument("--no-spawn", action="store_true", help="only the scan's objects")
     ap.add_argument("--out", help="output folder (default runs/track_<track folder's parent>)")
     args = ap.parse_args(argv)
@@ -534,12 +535,21 @@ def main(argv=None):
     cached = detect.load_detections(detect.cache_path(track_dir, labels))
     detector = None if cached is not None else detect.Detector(labels)
     src = fr.FolderSource(track_dir)
-    tracker = Tracker(objects, table, spawn=not args.no_spawn)
+    game = None
+    if args.ball:
+        from xray import shell
+        cups, balls = shell.split(objects)
+        tracker = Tracker(cups, table, labels={c["label"] for c in cups}, spawn=not args.no_spawn)
+        game = shell.ShellGame(tracker, balls, table, args.scan)
+    else:
+        tracker = Tracker(objects, table, spawn=not args.no_spawn)
     states, ms = [], []
     for f in src:
         dets = cached.get(src.ids[f.index], []) if detector is None else detector(f.rgb)
         t = time.perf_counter()
         tracker.update(f, dets)
+        if game is not None:
+            game.update(f, dets)
         ms.append(time.perf_counter() - t)
         if f.index == 0 and (args.target_pixel or args.target_point):
             p = point_at_pixel(f, *args.target_pixel) if args.target_pixel else np.array(args.target_point)
@@ -547,7 +557,8 @@ def main(argv=None):
             tracker.target_id = None if tr is None else tr.id
             print(f"target: {'none (no depth there)' if tr is None else f'{tr.label} {tr.id} at {r4(tr.position)}'}")
         fps = None if f.index == 0 else 1 / max(1e-3, src.times[f.index] - src.times[f.index - 1])
-        states.append(tracker.message(f, fps))
+        msg = tracker.message(f, fps)
+        states.append(game.message(msg) if game is not None else msg)
     with open(out / "states.jsonl", "w") as fh:
         for s in states:
             fh.write(json.dumps(s, separators=(",", ":")) + "\n")
@@ -558,6 +569,12 @@ def main(argv=None):
         runs = [r for r in runs if r[2] is not None]
         print(f"  {tr.id}{'*' if tr.target else ' '} {tr.label:10s} end {r4(tr.position)} {tr.state}: "
               + ", ".join(f"{a:.1f}-{b:.1f} {v}" for a, b, v in runs if b - a >= 0.3 or v != VISIBLE))
+    if game is not None and game.balls:
+        for b in game.balls:
+            runs = timeline(states, lambda s: next((x["state"] + (f" (cup {x['inside']})" if x["inside"] is not None else "")
+                                                    for x in s["ball"]["balls"] if x["id"] == b.id), None))
+            print(f"  {b.id}{'*' if b is game.target else ''}: " + ", ".join(f"{a:.1f}-{c:.1f} {v}" for a, c, v in runs if c - a >= 0.3))
+        print("events:\n" + "\n".join(f"  {t:6.2f} s  {e}" for t, e in game.events))
     return 0
 
 
