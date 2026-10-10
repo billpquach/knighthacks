@@ -10,12 +10,12 @@ export class RobotScene {
     this.container = container;
     this.labels = labels;
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x151c1e);
+    this.scene.background = new THREE.Color(0x101722);
     this.camera = new THREE.PerspectiveCamera(66, 1, 0.01, 100);
     this.camera.up.set(0, 0, 1);
     this.perspective = this.camera;
     this.mapCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, .01, 100);
-    this.view = 'map';
+    this.view = 'robot';
     this.lens = G8_LENS;
     this.environment = new THREE.Group();
     this.scene.add(this.environment);

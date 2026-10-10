@@ -32,7 +32,7 @@ function projection(view) {
 }
 $('map-view').onclick = () => projection('map');
 $('robot-view').onclick = () => projection('robot');
-projection('map');
+projection('robot');
 
 async function fetchScene(token) {
   if (fileScene) return;
