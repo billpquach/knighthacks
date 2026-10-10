@@ -125,6 +125,60 @@ class Detector:
         return out
 
 
+# ---------------------------------------------------------------------------------------- per-scan cache
+def cache_path(folder, labels):
+    return Path(folder) / f"detections_{key(labels)}.npz"
+
+
+def save_detections(path, per_frame, labels, shape):
+    """per_frame: {frame id: [Detection]} -> one compressed file (masks bit-packed)."""
+    rows = [(k, d) for k, ds in sorted(per_frame.items()) for d in ds]
+    h, w = shape
+    np.savez_compressed(
+        path, labels=np.array(list(labels)), shape=np.array([h, w]), frames=np.array(sorted(per_frame), dtype=np.int64),
+        frame=np.array([k for k, _ in rows], dtype=np.int64),
+        label=np.array([list(labels).index(d.label) if d.label in labels else -1 for _, d in rows], dtype=np.int64),
+        score=np.array([d.score for _, d in rows], dtype=np.float32),
+        box=np.array([d.box for _, d in rows], dtype=np.float32).reshape(-1, 4),
+        mask=np.array([np.packbits(d.mask.reshape(-1)) for _, d in rows], dtype=np.uint8).reshape(len(rows), -1))
+
+
+def load_detections(path):
+    """{frame id: [Detection]} from save_detections' file (None if there is none)."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    z = np.load(path)
+    labels, (h, w) = [str(x) for x in z["labels"]], [int(x) for x in z["shape"]]
+    out = {int(k): [] for k in z["frames"]}
+    for i in range(len(z["frame"])):
+        m = np.unpackbits(z["mask"][i])[:h * w].reshape(h, w).astype(bool)
+        lab = labels[z["label"][i]] if z["label"][i] >= 0 else "?"
+        out.setdefault(int(z["frame"][i]), []).append(Detection(lab, float(z["score"][i]), tuple(float(v) for v in z["box"][i]), m))
+    return out
+
+
+def detect_scan(folder, labels, weights=None, conf=0.2, refresh=False, log=print):
+    """Detections on every frame of a scan folder, cached as <folder>/detections_<labels>.npz (the detector
+    runs once per scan; later calls read the file)."""
+    labels = parse_prompt(labels) if isinstance(labels, str) else list(labels)
+    path = cache_path(folder, labels)
+    if not refresh:
+        cached = load_detections(path)
+        if cached is not None:
+            return cached
+    from .frames import frame_ids, read_frame
+    det = Detector(labels, weights, conf)
+    out, shape = {}, None
+    for k in frame_ids(folder):
+        rgb = read_frame(folder, k)[0]
+        shape = rgb.shape[:2]
+        out[k] = det(rgb)
+    save_detections(path, out, labels, shape or (640, 480))
+    log(f"detections for {labels} on {len(out)} frames ({np.median(det.ms):.0f} ms each) -> {path}")
+    return out
+
+
 # ---------------------------------------------------------------------------------------- commands
 @contextlib.contextmanager
 def in_models():
