@@ -18,12 +18,14 @@ Each frame:
      viewing ray by 0.75 x the object's radius. A detection that shows only part of its object (touching the
      image edge, or partly behind a nearer detection) keeps the track's height, and its position unless the
      two are more than 6 cm apart; one partly behind another and farther than that is not used at all.
-     Detections of one label within 6 cm of each other are one object (the best score stays).
+     Detections of one label within 6 cm of each other are one object (the best score stays); one whose top
+     is under 0.65 x the height of every object of its label is something smaller seen as that label.
   2. associate, per label: distance sqrt(dxy^2 + (0.3 dz)^2) (height is the noisiest axis), +3 cm for a hidden
-     object (one in view comes first), the assignment with the least total (Hungarian). Leaving a track
-     unmatched costs its gate, so no detection farther than that takes it: 0.12 m (0.15 m hidden) + 1.5 x speed
-     x dt x (1 + frames unseen), at most 0.4 m. Nothing was seen moving an object out of view: its gate stays
-     0.15 m.
+     object (one in view comes first), as a share of the track's gate; the assignment with the least total
+     (Hungarian), where leaving a track unmatched costs 1, so no detection beyond the gate takes it. Gate:
+     0.12 m (0.15 m hidden) + 1.5 x speed x dt x (1 + frames unseen), at most 0.4 m; nothing was seen moving
+     an object out of view, so its gate stays 0.15 m. A share, not metres: an uncertain track (wide gate)
+     doesn't take the detection right at a well-placed one.
   3. filter: alpha-beta on position and velocity. A still object gains 0.15 / 0.02 (steady), a moving one
      0.6 / 0.25 (it keeps up). Never below the table. Without a detection it stays where it was last seen.
   4. an object without a detection is explained by the depth image where it should be:
@@ -74,6 +76,8 @@ class Measurement:
     edge: bool                      # the box touches the image edge: part of the object is cut off
     box: tuple
     depth: float                    # distance of the centre from the camera
+    top: float                      # height of its top (95th percentile of its points)
+    bottom: float                   # height of its bottom (5th percentile)
     mask: np.ndarray = field(repr=False)
     n_points: int = 0
     behind: bool = False            # partly hidden behind a nearer detection
@@ -93,8 +97,8 @@ def measure(frame, det, clean, table_z=None, radius=None, erode_px=3, edge_px=3)
     h, w = frame.rgb.shape[:2]
     x0, y0, x1, y1 = det.box
     edge = x0 <= edge_px or y0 <= edge_px or x1 >= w - 1 - edge_px or y1 >= h - 1 - edge_px
-    return Measurement(det.label, float(det.score), c, bool(edge), det.box, float(np.linalg.norm(ray)), det.mask,
-                       int(len(p)))
+    return Measurement(det.label, float(det.score), c, bool(edge), det.box, float(np.linalg.norm(ray)),
+                       float(np.percentile(p[:, 2], 95)), float(np.percentile(p[:, 2], 5)), det.mask, int(len(p)))
 
 
 def one_per_place(ms, apart=0.06):
@@ -210,8 +214,8 @@ class Track:
         self.pending, self.pending_n = None, 0
         self.back = 0                                   # detections in a row while coming back (hidden -> visible)
         self.reacquired_t = None
-        self.z_seen = None                              # the latest detection's own height (None: edge-cut)
-        self.history = deque()                          # (t, position, z_seen) over the last HISTORY_S
+        self.top_seen = self.bottom_seen = None         # the latest detection's top and bottom height (None: only part seen)
+        self.history = deque()                          # (t, position) over the last HISTORY_S
         self.target = False
         self.extra = {}                                 # fields other parts add to the message (the shell game)
 
@@ -233,7 +237,7 @@ class Track:
     def seen(self, m, t, dt, table_z=None):
         self.score = m.score
         part = m.edge or m.behind
-        self.z_seen = None if part else float(m.position[2])
+        self.top_seen, self.bottom_seen = (None, None) if part else (m.top, m.bottom)
         if self.state in HIDDEN:                        # coming back: a few good detections in a row first
             into_view = self.state == OUT_OF_VIEW
             low = 0.0 if distance(self.predicted, m.position) < 0.05 else 0.3 if into_view else 0.5
@@ -301,7 +305,7 @@ class Track:
             self.state, self.pending, self.pending_n = want, None, 0
 
     def remember(self, t):
-        self.history.append((t, self.position.copy(), self.z_seen))
+        self.history.append((t, self.position.copy()))
         while self.history and t - self.history[0][0] > HISTORY_S:
             self.history.popleft()
 
@@ -328,6 +332,7 @@ class Tracker:
         self.next_id, self.target_id = 0, None
         self.t, self.n = None, 0
         self.measurements = []                          # this frame's, after one_per_place (for the overlay)
+        self.others = []                                # (label, position) of objects followed elsewhere (balls)
         for o in objects:
             self.add(o["label"], o["position"], o.get("size"), o.get("points"))
 
@@ -355,17 +360,18 @@ class Tracker:
         radius = {tr.label: tr.radius for tr in self.tracks}
         ms = [measure(frame, d, clean, self.table_z, radius.get(d.label)) for d in drop_cups_on_balls(detections)
               if self.follows(d.label)]
-        ms = mark_behind(one_per_place([m for m in ms if m is not None]))
+        ms = mark_behind([m for m in ms if m is not None])
+        ms = one_per_place([m for m in ms if not self.too_short(m)])
         matched = {}
         for label in {tr.label for tr in self.tracks}:
             rows = [i for i, tr in enumerate(self.tracks) if tr.label == label]
             cols = [j for j, m in enumerate(ms) if m.label == label]
             if not cols:
                 continue
-            cost = np.array([[distance(self.tracks[i].predicted, ms[j].position) + HIDDEN_COST * (self.tracks[i].state in HIDDEN)
-                              for j in cols] for i in rows])
             gates = np.array([self.tracks[i].gate(dt) for i in rows])
-            for a, b in assign(cost, gates).items():
+            cost = np.array([[distance(self.tracks[i].predicted, ms[j].position) + HIDDEN_COST * (self.tracks[i].state in HIDDEN)
+                              for j in cols] for i in rows]) / gates[:, None]
+            for a, b in assign(cost, np.ones(len(rows))).items():
                 matched[rows[a]] = cols[b]
         for i, tr in enumerate(self.tracks):
             m = ms[matched[i]] if i in matched else None
@@ -382,6 +388,13 @@ class Tracker:
             tr.remember(t)
         self.measurements = ms
         return self.tracks
+
+    def too_short(self, m):
+        """A whole detection whose top is under 0.65 x the height of every object of its label: something smaller
+        seen as that label (a ball as a cup)."""
+        heights = [tr.size[2] for tr in self.tracks if tr.label == m.label]
+        return (self.table_z is not None and not m.edge and not m.behind and bool(heights)
+                and m.top - self.table_z < 0.65 * min(heights))
 
     def explain(self, tr, frame, margin=8):
         """Why a track has no detection: 'away' (behind the camera or off the image), 'covered' (the depth where it
@@ -417,8 +430,9 @@ class Tracker:
         self.candidates = [c for c in self.candidates if self.n - c["frame"] <= 1]
         for c in [c for c in self.candidates if c["n"] >= 5]:
             self.candidates.remove(c)
-            near = [(tr, math.hypot(*(tr.position[:2] - c["position"][:2]))) for tr in self.tracks]
-            if any(d < 0.15 and tr.unseen == 0 or d < 0.08 and tr.label != c["label"] for tr, d in near):
+            near = [(tr.label, tr.unseen, math.hypot(*(tr.position[:2] - c["position"][:2]))) for tr in self.tracks]
+            near += [(label, 0, math.hypot(*(np.asarray(p)[:2] - c["position"][:2]))) for label, p in self.others]
+            if any(d < 0.15 and unseen == 0 or d < 0.08 and label != c["label"] for label, unseen, d in near):
                 continue                                # a tracked object, or another kind of object seen as this one
             gone = [tr for tr in self.tracks if tr.label == c["label"] and tr.unseen >= 5]
             if gone:
