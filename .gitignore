@@ -1,3 +1,15 @@
+# Unity stuff
+Library/
+obj/
+Logs/
+Temp/
+UserSettings/
+Build/
+Builds/
+.vs/
+*.csproj
+*.sln
+*.apk
 # runs, recordings and scans stay off GitHub ------------------------------------
 runs/
 *.r3d
@@ -20,3 +32,12 @@ __pycache__/
 # secrets --------------------------------------------------------------------------
 .env
 *.key
+
+receiver/recordings/
+UserSettings/
+Build/
+Builds/
+.vs/
+*.csproj
+*.sln
+*.apk
