@@ -192,10 +192,72 @@ def object_points(depth, conf, K, T, mask, max_depth=3.0, erode_px=5):
     return fr.backproject(depth, K, T, nearest_layer(depth, m))
 
 
+def fit_circle(xy):
+    """Least-squares circle through 2-D points (Kasa): (centre, radius), or None."""
+    if len(xy) < 8:
+        return None
+    sol = np.linalg.lstsq(np.c_[2 * xy, np.ones(len(xy))], (xy ** 2).sum(1), rcond=None)[0]
+    r2 = sol[2] + sol[:2] @ sol[:2]
+    return (sol[:2], float(np.sqrt(r2))) if r2 > 0 else None
+
+
+def angular_span(angles):
+    """How much of the circle (radians) the angles cover: 2 pi minus the widest gap between them."""
+    a = np.sort(np.mod(angles, 2 * np.pi))
+    return float(2 * np.pi - np.max(np.diff(np.r_[a, a[0] + 2 * np.pi])))
+
+
+def complete_round(pts, want, table_z=None, slice_h=0.005, sector_deg=15, spacing=0.005, seed=0):
+    """Cups and balls are round about a vertical axis, so the sides a scan never saw can be filled in from the
+    sides it did: per horizontal slice, the wall's radius around the axis, repeated in each empty direction.
+    A scan from one side gives half a shell; this gives the whole object (and its true centre). Returns
+    (points, how many were added); unchanged if the axis can't be found (too few points, or not round)."""
+    if want not in ("cup", "ball") or len(pts) < 100:
+        return pts, 0
+    z0 = pts[:, 2].min()
+    n_sl = max(1, int(np.ceil((pts[:, 2].max() - z0) / slice_h)))
+    sl = np.minimum(((pts[:, 2] - z0) / slice_h).astype(int), n_sl - 1)
+    centres = []
+    for s in range(n_sl):                                   # the axis: the slices' circle centres
+        xy = pts[sl == s, :2]
+        f = fit_circle(xy) if len(xy) >= 15 else None
+        if f is not None and 0.012 <= f[1] <= 0.07 and angular_span(np.arctan2(*(xy - f[0]).T[::-1])) >= np.radians(60):
+            centres.append(f[0])
+    if len(centres) < 3:
+        return pts, 0
+    axis = np.median(centres, axis=0)
+    d = np.hypot(*(pts[:, :2] - axis).T)
+    n_sec = int(round(360 / sector_deg))
+    sector = (np.mod(np.arctan2(pts[:, 1] - axis[1], pts[:, 0] - axis[0]), 2 * np.pi) / np.radians(sector_deg)).astype(int) % n_sec
+    rng, add = np.random.default_rng(seed), []
+    for s in range(n_sl):
+        m = sl == s
+        if m.sum() < 5:
+            continue
+        r = float(np.percentile(d[m], 80))                  # the wall (not the cap inside it)
+        z = z0 + (s + 0.5) * slice_h
+        if r < 0.01 or (table_z is not None and z < table_z + 0.01):
+            continue
+        have = np.zeros(n_sec, bool)
+        have[sector[m & (d > 0.6 * r)]] = True
+        if have.all():
+            continue
+        a = np.linspace(0, 2 * np.pi, max(n_sec, int(2 * np.pi * r / spacing)), endpoint=False)
+        a = a[~have[(a / np.radians(sector_deg)).astype(int) % n_sec]]
+        a = a + rng.uniform(-0.5, 0.5, len(a)) * spacing / r          # a little jitter: no visible rings
+        rr = r + rng.normal(0, 0.0015, len(a))
+        add.append(np.c_[axis[0] + rr * np.cos(a), axis[1] + rr * np.sin(a), z + rng.uniform(-0.5, 0.5, len(a)) * slice_h])
+    if not add:
+        return pts, 0
+    add = np.vstack(add)
+    return np.vstack([pts, add]), len(add)
+
+
 def refine(seed_points, keyframes, table_z=None, label=None, dets=None, ball_diameter=0.064, seed_cell=0.02,
-           radius=0.015, above_table=0.01, thin=0.005, join=0.015, outliers=False, max_depth=3.0):
+           radius=0.015, above_table=0.01, thin=0.005, join=0.015, outliers=False, max_depth=3.0, complete=True):
     """dets: one list of xray.detect Detections per keyframe (or None). label: the object's label or target
-    phrase (decides which detections fit and the size trim)."""
+    phrase (decides which detections fit and the size trim). complete: a cup's or ball's unseen sides filled in
+    by symmetry (complete_round)."""
     t0 = time.time()
     want = kind(label) if label else None
     seed = voxel_mean(np.asarray(seed_points, float).reshape(-1, 3), seed_cell)
@@ -226,8 +288,11 @@ def refine(seed_points, keyframes, table_z=None, label=None, dets=None, ball_dia
             pts = pts[in_cylinder(pts, r_trim)]
         if outliers and len(pts):
             pts = pts[drop_outliers(pts)]
-    out = dict(points=pts, n_points=int(len(pts)), views=views, masked_views=masked, kind=want, table_z=table_z,
-               seed_points=int(len(seed)), seconds=round(time.time() - t0, 2))
+    filled = 0
+    if complete and len(pts):
+        pts, filled = complete_round(pts, want, table_z)
+    out = dict(points=pts, n_points=int(len(pts)), filled=filled, views=views, masked_views=masked, kind=want,
+               table_z=table_z, seed_points=int(len(seed)), seconds=round(time.time() - t0, 2))
     if len(pts):
         out.update(center=np.round(np.median(pts, axis=0), 4).tolist(),
                    size=np.round(np.percentile(pts, 95, axis=0) - np.percentile(pts, 5, axis=0), 4).tolist())
@@ -237,7 +302,8 @@ def refine(seed_points, keyframes, table_z=None, label=None, dets=None, ball_dia
 
 
 def summary(r):
-    return {k: r[k] for k in ("n_points", "center", "size", "views", "masked_views", "kind", "table_z", "seed_points", "seconds")}
+    return {k: r[k] for k in ("n_points", "filled", "center", "size", "views", "masked_views", "kind", "table_z", "seed_points",
+                              "seconds")}
 
 
 def objects_from_detections(keyframes, dets, min_score=0.5, join=0.06, min_views=2, max_depth=3.0):

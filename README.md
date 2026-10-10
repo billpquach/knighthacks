@@ -25,6 +25,10 @@ python -m xray.live --scan-seconds 20 --ask --ball --video 2>&1 | tee -i live.lo
 python -m xray.live --scan <scan folder> --results <ground3d output>   # act 1: Qwen-3D's answer is the target
 ```
 
+Scanning: circle the cups slowly (a quarter turn at least, half is better), about 40-60 cm from them and looking
+down at about 45 degrees; the scan goes on until it has 20 views (`--min-keyframes`). Cups and balls the scan saw
+from one side only are completed by symmetry (`ground3d.refine.complete_round`), so their twins are whole.
+
 It serves `/state`, `/state.json`, `/frame.jpg`, `/scene` and `/metrics` on port 8080 (the same endpoints as
 `replay_server.py`), plus the viewer at `/` once it is built. With `--ask`, Qwen-3D loads while the phone scans;
 questions are typed in the console or sent with `curl -X POST <jetson>:8080/prompt -d 'the cup next to the ball'`,
