@@ -4,9 +4,8 @@
 
 The output folder is what python -m ground3d.ground --out wrote. Each answer is drawn from its refined cloud
 (<slug>_refined.ply, from ground3d.refine) when there is one, else from the raw answer (--raw: always the raw
-one), in the x-ray style of xray.render: one colour family for all objects (near pale cyan, far blue,
-brighter where the surface faces the camera; hidden points faint). A number at each object matches the
-legend (score and query). Writes view_<k>.jpg for the keyframes that see the first answer best.
+one), in the x-ray style of xray.render (a sparse, see-through cloud; the first answer is drawn as the target).
+A number at each object matches the legend (score and query). Writes view_<k>.jpg for the keyframes that see the first answer best.
 """
 import argparse
 import json
@@ -76,7 +75,10 @@ def main(argv=None):
         img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         tags = []
         for i, (a, pts, which) in enumerate(answers, 1):
-            info = render.draw_cloud(img, pts, K, T, depth, centre=a.get("refined", {}).get("center") or a.get("center"))
+            ref = a.get("refined") or {}
+            size = ref.get("size")
+            info = render.draw_cloud(img, pts, K, T, depth, centre=ref.get("center") or a.get("center"),
+                                     radius=max(size[0], size[1]) / 2 if size else None, target=(i == 1), order_seed=i)
             if info["label_xy"]:
                 tags.append((i, info["label_xy"]))
         for i, (x, y) in tags:
@@ -88,8 +90,10 @@ def main(argv=None):
         cv2.imwrite(str(out / f"view_{k}.jpg"), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
     print(f"{len(pick)} views -> {out}/ (" + ", ".join(f"view_{k}.jpg" for k in pick) + ")")
     for i, (a, pts, which) in enumerate(answers, 1):
+        size = (a.get("refined") or {}).get("size")
         print(f"  {i}  {a['score']:.3f} ({a['band']}) '{a['query']}': {len(pts)} {which} points"
-              + (f" at {np.round(np.asarray(a['center']), 3).tolist()}" if a.get("center") else ""))
+              + (f" at {np.round(np.asarray(a['center']), 3).tolist()}" if a.get("center") else "")
+              + (f", size {'x'.join(f'{100 * v:.0f}' for v in size)} cm" if size else ""))
     return 0
 
 

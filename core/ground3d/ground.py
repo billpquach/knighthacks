@@ -292,6 +292,8 @@ def refine_answers(scan, answers, points, out=None, log=print):
     try:
         keyframes = refine_mod.load_keyframes(scan)
         table = refine_mod.table_height(keyframes)
+        # detector masks if the scan already has them cached (YOLOE is not loaded here: Qwen-3D holds the GPU)
+        dets = refine_mod.scan_detections(scan, refine_mod.DEFAULT_PROMPT, use_detector=False, log=log)
     except Exception as e:
         for a in answers:
             a["refined"] = {"error": f"{type(e).__name__}: {e}"}
@@ -300,12 +302,12 @@ def refine_answers(scan, answers, points, out=None, log=print):
         if not len(pts):
             continue
         try:
-            r = refine_mod.refine(pts, keyframes, table)
+            r = refine_mod.refine(pts, keyframes, table, label=a.get("target") or a["query"], dets=dets)
             a["refined"] = refine_mod.summary(r)
             if out is not None and r["n_points"]:
                 refine_mod.write_ply(Path(out) / f"{slug(a['query'])}_refined.ply", r["points"])
             log(f"  refined '{a['query']}': {len(pts)} -> {r['n_points']} points in {r['seconds']:.2f} s"
-                + (f", centre {r['center']}" if r["center"] else ""))
+                + (f", centre {r['center']}, size {refine_mod.size_cm(r['size'])}" if r["center"] else ""))
         except Exception as e:
             a["refined"] = {"error": f"{type(e).__name__}: {e}"}
 
