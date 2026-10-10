@@ -15,7 +15,8 @@ Run from core/, with the venv that has torch (CUDA), transformers 4.51.1 and acc
 Memory plan for the 8 GB board: 8-bit language model, ViT and embedding table (quant.py); the ViT is
 unloaded once the scan is encoded; 15 frames, or 10 if 15 runs out of memory (the ViT is still there then).
 
-Outputs (one-shot): <out>/results.json (timings, RAM, every answer), and a .ply of each answer's points.
+Outputs (one-shot): <out>/results.json (timings, RAM, every answer), a .ply of each answer's points, and
+<slug>_refined.ply: the object collected densely from the scan around the answer (ground3d.refine, on the CPU).
 A job's answer: <jobs>/result.json. The first query's answer is the target for the tracker.
 """
 import argparse
@@ -35,7 +36,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 
-from . import quant, scene as scene_mod, upstream  # noqa: E402
+from . import quant, refine as refine_mod, scene as scene_mod, upstream  # noqa: E402
 
 GB = 1024 ** 3
 HIGH, LOW = 0.5, 0.3                          # confidence bands for a score
@@ -285,6 +286,30 @@ def describe(r):
             + (f" at {r['center']}" if r["center"] else "") + f", {r['seconds']:.2f} s")
 
 
+def refine_answers(scan, answers, points, out=None, log=print):
+    """Each answer's dense, clean cloud from the scan (ground3d.refine, CPU); adds answer["refined"] and,
+    with `out`, writes <slug>_refined.ply. A failure here is noted, never fatal: the raw answer stands."""
+    try:
+        keyframes = refine_mod.load_keyframes(scan)
+        table = refine_mod.table_height(keyframes)
+    except Exception as e:
+        for a in answers:
+            a["refined"] = {"error": f"{type(e).__name__}: {e}"}
+        return
+    for a, pts in zip(answers, points):
+        if not len(pts):
+            continue
+        try:
+            r = refine_mod.refine(pts, keyframes, table)
+            a["refined"] = refine_mod.summary(r)
+            if out is not None and r["n_points"]:
+                refine_mod.write_ply(Path(out) / f"{slug(a['query'])}_refined.ply", r["points"])
+            log(f"  refined '{a['query']}': {len(pts)} -> {r['n_points']} points in {r['seconds']:.2f} s"
+                + (f", centre {r['center']}" if r["center"] else ""))
+        except Exception as e:
+            a["refined"] = {"error": f"{type(e).__name__}: {e}"}
+
+
 def serve(g, jobs, parent, ram, args):
     """Preloaded: wait for jobs/job.json ({"scan", "queries" or "query", "frames"}), answer it into
     jobs/result.json, then exit so the memory is free for tracking."""
@@ -304,11 +329,13 @@ def serve(g, jobs, parent, ram, args):
         sc = g.prepare(job["scan"], int(job.get("frames", args.frames)), args.max_depth)
         res.update(frames=len(sc.frames), voxels=sc.n_voxels, target_points=len(sc.target_xyz),
                    scene_s={k: round(v, 2) for k, v in sc.timing.items()})
-        answers = []
+        answers, points = [], []
         for q in job.get("queries") or [job["query"]]:
-            r, _ = g.query(q)
+            r, pts = g.query(q)
             answers.append(r)
+            points.append(pts)
             print(describe(r), flush=True)
+        refine_answers(job["scan"], answers, points, out=jobs)
         res.update(answers=answers, target=answers[0])
     except Exception as e:                                  # the live runner reads the error and falls back
         res["error"] = ("OUT OF MEMORY: " if is_oom(e) else "") + f"{type(e).__name__}: {str(e).splitlines()[0][:300]}"
@@ -335,6 +362,7 @@ def main(argv=None):
     ap.add_argument("--no-vit8", action="store_true", help="keep the ViT in bf16 (more memory)")
     ap.add_argument("--no-emb8", action="store_true", help="keep the embedding table in bf16 (more memory)")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--no-refine", action="store_true", help="skip the dense object clouds (ground3d.refine)")
     ap.add_argument("--out", help="one-shot output folder (default: runs/ground3d_HHMMSS)")
     args = ap.parse_args(argv)
     if not args.serve and not (args.scan and args.query):
@@ -380,12 +408,16 @@ def main(argv=None):
         print(f"scene: {len(sc.frames)} frames, {sc.grid[0]}x{sc.grid[1]} tokens each -> {sc.n_voxels} voxels, "
               f"{len(sc.target_xyz)} target points; " + ", ".join(f"{k} {v:.1f} s" for k, v in sc.timing.items())
               + f"; RAM in use {ram.now:.2f} GB", flush=True)
+        points = []
         for q in args.query:
             r, pts = g.query(q)
             if len(pts):
                 write_ply(out / f"{slug(q)}.ply", pts)
             res["answers"].append(r)
+            points.append(pts)
             print("  " + describe(r), flush=True)
+        if not args.no_refine:
+            refine_answers(args.scan, res["answers"], points, out=out)
     except (Exception, SystemExit) as e:
         msg = str(e).splitlines()[0][:300] if str(e) else type(e).__name__
         res["error"] = ("OUT OF MEMORY: " if isinstance(e, Exception) and is_oom(e) else "") + f"{type(e).__name__}: {msg}"

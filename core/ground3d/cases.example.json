@@ -3,14 +3,56 @@
   "cases": [
     {
       "name": "act1",
-      "scan": "~/knighthacks26/core/runs/scan_act1/scan",
+      "scan": "~/knighthacks26/core/runs/scan_act1b/scan",
       "queries": [
         "the cup closest to the can",
-        "the cup next to the can",
-        "the cup beside the can",
-        "the cup next to the ball"
+        "the cup that is closest to the can",
+        "the cup to the left of the can",
+        "the can",
+        "the ball"
       ],
-      "expect": {}
+      "expect": {
+        "the cup closest to the can": {
+          "score": 0.522,
+          "center": [
+            -0.229,
+            1.192,
+            0.853
+          ]
+        },
+        "the cup that is closest to the can": {
+          "score": 0.444,
+          "center": [
+            0.039,
+            1.124,
+            0.834
+          ]
+        },
+        "the cup to the left of the can": {
+          "score": 0.437,
+          "center": [
+            0.04,
+            1.124,
+            0.834
+          ]
+        },
+        "the can": {
+          "score": 0.448,
+          "center": [
+            -0.352,
+            1.31,
+            0.843
+          ]
+        },
+        "the ball": {
+          "score": 0.634,
+          "center": [
+            0.238,
+            1.237,
+            0.799
+          ]
+        }
+      }
     }
   ]
 }
