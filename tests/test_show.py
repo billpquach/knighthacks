@@ -40,9 +40,10 @@ class TestShow(unittest.TestCase):
             (res / "results.json").write_text(json.dumps({"answers": [dict(query=q, score=0.61, band="high", center=[0, 0, 0])]}))
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(show.main([str(t / "scan"), str(res), "--out", str(t / "out")]), 0)
-            img = cv2.imread(str(t / "out" / "view_0.jpg"))
-            centre = img[300:340, 220:260].astype(int)
-            self.assertTrue((np.abs(centre - [0, 220, 255]).sum(-1) < 120).any())   # the answer's colour at its place
+            img = cv2.imread(str(t / "out" / "view_0.jpg")).astype(int)
+            drawn = np.abs(img - 90).sum(-1) > 30                 # dots on the grey frame (the colours are checked
+            self.assertGreater(drawn[300:341, 220:261].sum(), 10)  # in test_refine: JPEG blurs small coloured dots)
+            self.assertFalse(drawn[400:].any())                   # and nowhere else
 
     def test_slug_matches_the_runner(self):
         try:
