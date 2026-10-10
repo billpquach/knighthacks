@@ -25,7 +25,7 @@ test('static scene loads on connect and track, supports local files and both pro
     await page.getByRole('button', { name, exact: true }).click();
     await expect(page.getByRole('button', { name, exact: true })).toHaveAttribute('aria-pressed', 'true');
     await page.waitForTimeout(200);
-    const pixels = await page.locator('canvas').evaluate(canvas => {
+    const pixels = await page.locator('#scene canvas').evaluate(canvas => {
       const gl = canvas.getContext('webgl2'), data = new Uint8Array(canvas.width * canvas.height * 4);
       gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, data);
       let bright = 0;

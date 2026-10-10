@@ -26,6 +26,7 @@ T0 = time.time()
 STATES = []
 SCENE = None
 TRACK = None
+METRICS = None
 VIEWER_DIST = Path(__file__).resolve().parent / "viewer" / "dist"
 
 
@@ -93,6 +94,16 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == "/metrics":
+            body = json.dumps(METRICS.latest() if METRICS else {
+                'version': 1, 'device': None, 'memory_kind': 'shared', 'available': False,
+                'reason': 'not_jetson', 'metrics': {}, 'age_ms': None, 'sample_id': None}).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', str(len(body)))
             self.end_headers()
             self.wfile.write(body)
         elif path == "/scene":
@@ -196,9 +207,14 @@ if __name__ == "__main__":
         from recorded_track import RecordedTrack
         TRACK = RecordedTrack(a.track, STATES)
     T0 = time.time()
+    from core.jetson.metrics_server import Metrics
+    METRICS = Metrics()
     srv = ThreadingHTTPServer((a.host, a.port), H)
     print(f"Serving on http://{a.host}:{a.port}  (/state, /state.json, /frame.jpg, /scene)")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        sys.exit(0)
+        pass
+    finally:
+        srv.server_close()
+        METRICS.stop()

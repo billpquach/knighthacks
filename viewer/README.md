@@ -35,6 +35,49 @@ fonts. No cloud deployment is involved.
 
 ## Connect the Jetson
 
+### Resource monitoring
+
+The resource strip shows shared physical memory (CPU + GPU, not dedicated VRAM),
+GPU and CPU utilization, temperature, board power, and swap, with 60-second
+trends. Memory is shown in GiB. It uses the existing `core/jetson/jetson_stats.py`
+sampler: `/proc/meminfo` for used/total memory and `tegrastats` for other fields.
+It does not claim CUDA-process allocation, free dedicated VRAM, or GPU memory
+bandwidth. Reference: [NVIDIA CUDA for Tegra](https://docs.nvidia.com/cuda/cuda-for-tegra-appnote/index.html#memory-management).
+
+On the Jetson, from the repository root:
+
+```bash
+python3 -m core.jetson.metrics_server --host 0.0.0.0 --port 8083
+```
+
+In viewer connection settings, set **Jetson metrics URL** to
+`http://<jetson-ip>:8083/metrics`. Leave it empty if the robot's existing server
+already serves `/metrics` on the same origin. The standalone server needs only
+Python's standard library; `tegrastats` must be on PATH with permissions to read
+the sensors. Do not run the browser or whole viewer as root. Missing tegrastats
+fields show `--` and PARTIAL; hardware access has not been verified yet.
+
+The replay server also serves `/metrics`, detecting a Jetson device-tree model
+before starting the sampler. A non-Jetson returns NOT CONNECTED with no laptop
+resource values, even while playing a recording. Resource polling is independent
+of camera/telemetry and display freeze, so live machine load remains current.
+Polling is paused while the tab is hidden. Failed or stale readings clear values
+and trends; old readings are never represented as current utilization.
+
+`GET /metrics` returns version 1, `device`, `memory_kind: "shared"`, `available`,
+`reason`, `sample_id`, `age_ms`, and `metrics` containing `ram_used_gb`,
+`ram_total_gb`, `gpu_pct`, `cpu_pct`, `temp_c`, `power_w`, `swap_used_mb`.
+The existing sampler's `_gb` keys contain GiB. Missing fields are null, not zero.
+Consumers reject samples aged 5 seconds or unchanged IDs for 5 seconds. The
+service uses one background sampler rather than a subprocess per request.
+
+For the future live server, reuse one `Metrics` instance from
+`core.jetson.metrics_server`, return `latest()` at `/metrics`, and call `stop()`
+on shutdown. The standalone endpoint is read-only and permits CORS; it has no
+authentication, so expose it only on a trusted LAN/hotspot, never the public web.
+
+### Camera and state
+
 Open the radio/connection control and enter `http://<jetson>:8080`. The camera
 endpoint defaults to `/frame.jpg`, as requested. The source URL, layout, and
 camera path are saved in browser local storage. The original Jetson server
