@@ -17,7 +17,6 @@
         "the cup beside the can": {"score": 0.532, "center": [1.268, -0.442, 0.864]},
         "the cup closest to the can": {"score": 0.609, "center": [1.269, -0.442, 0.859]},
         "the clear cup next to the can": {"score": 0.357, "center": [1.270, -0.442, 0.858]}
-        "the cup next to the ball": {"score": 0.548}
       }
     }
   ]
