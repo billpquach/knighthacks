@@ -100,8 +100,7 @@ class TestRuns(unittest.TestCase):
         for f in ("summary.md", f"{r['id']}.log", f"{r['id']}.samples.jsonl", f"{r['id']}/results.json"):
             self.assertTrue((self.out / f).exists(), f)
         self.assertIn("=== BENCH SUMMARY", text)
-        self.assertNotIn("weights 3/16", text)                    # one weights line, not sixteen
-        self.assertIn("weights 16/16", text)
+        self.assertIn("weights 3/16", text)                       # load progress shows (~100 s otherwise silent)
 
     def test_relative_out_and_sweep(self):
         cwd = os.getcwd()

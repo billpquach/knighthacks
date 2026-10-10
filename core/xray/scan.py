@@ -12,6 +12,7 @@ Outputs <out>/scan/ (color, depth, conf, intrinsic, pose, meta.json) and a SCAN 
 meta.json's world_from_arkit puts later frames of the same phone session in the same world.
 """
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -129,15 +130,17 @@ def agreement_cm(a, b, max_depth=4.0, stride=2):
     return float(np.median(np.abs(b.depth[vi, ui][seen] - z[seen])) * 100), int(seen.sum())
 
 
-def consistency(keyframes):
-    """agreement_cm between keyframes from different parts of the scan: [(a, b, cm, pixels)]."""
+def consistency(keyframes, checks=5, gap=4):
+    """agreement_cm between keyframes from across the scan, each with a later one `gap` keyframes on (or
+    nearer, if those two don't see the same surfaces): [(a, b, cm, pixels)]."""
     n = len(keyframes)
-    pairs = sorted({(0, n // 4), (n // 4, n // 2), (n // 2, 3 * n // 4), (3 * n // 4, n - 1), (0, n // 2)})
     out = []
-    for a, b in pairs:
-        if a != b:
+    for a in sorted({int(round(x)) for x in np.linspace(0, max(0, n - 2), checks)}):
+        for b in range(min(n - 1, a + gap), a, -1):
             cm, px = agreement_cm(keyframes[a], keyframes[b])
-            out.append((a, b, cm, px))
+            if cm is not None or b == a + 1:
+                out.append((a, b, cm, px))
+                break
     return out
 
 
@@ -193,8 +196,9 @@ def main(argv=None):
           f"the floor, image down pointing down in {100 * world['image_down_share']:.0f}% of the keyframes")
     print("views agree: " + ", ".join(f"{a}->{b} {'-' if cm is None else f'{cm:.1f}'} cm ({px} px)" for a, b, cm, px in checks)
           + f": {verdict}")
-    print(f"files: {out}")
-    return 0
+    print(f"files: {out}", flush=True)
+    sys.stderr.flush()
+    os._exit(0)                     # record3d's teardown at a normal exit crashes (segfault); everything is written
 
 
 if __name__ == "__main__":
