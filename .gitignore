@@ -1,0 +1,22 @@
+# runs, recordings and scans stay off GitHub ------------------------------------
+runs/
+*.r3d
+**/scan/
+**/track/
+*.mp4
+*.zip
+# models and weights -----------------------------------------------------------
+models/
+*.pt
+*.pth
+*.engine
+*.onnx
+*.safetensors
+processor/
+# python ---------------------------------------------------------------------------
+__pycache__/
+*.pyc
+.venv/
+# secrets --------------------------------------------------------------------------
+.env
+*.key
