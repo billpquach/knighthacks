@@ -2,8 +2,8 @@
 
 A local Three.js viewer for the Jetson's `/state` SSE stream (or `/state.json`, the newest
 state once) and `/frame.jpg` x-ray camera feed. The default port is **8080**, defined in `replay_server.py`.
-The default spatial view is a top-down memory map; the navigation control switches
-to calibrated robot perspective. The interface supports split view, spatial view with camera inset, and camera
+The default spatial view is calibrated robot perspective; the radar control switches
+to the top-down memory map. The interface supports split view, spatial view with camera inset, and camera
 view with spatial inset. Select an object to inspect its bearing and distance;
 selection is local to the viewer and never commands the rover.
 

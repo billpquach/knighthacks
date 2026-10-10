@@ -19,7 +19,9 @@ test('static scene loads on connect and track, supports local files and both pro
   await page.goto('/');
   await expect(page.locator('#geometry-type')).toHaveText('POINT CLOUD');
   await expect.poll(() => requests).toBeGreaterThanOrEqual(2);
-  await expect(page.locator('#projection-label')).toHaveText('MEMORY MAP');
+  await expect(page.locator('#projection-label')).toHaveText('ROBOT PERSPECTIVE');
+  await expect(page.locator('#robot-view')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#map-view')).toHaveAttribute('aria-pressed', 'false');
   await expect(page.locator('#target-label')).toHaveText('Yellow ball');
   for (const name of ['Calibrated robot perspective', 'Memory map']) {
     await page.getByRole('button', { name, exact: true }).click();
@@ -35,6 +37,9 @@ test('static scene loads on connect and track, supports local files and both pro
     expect(pixels).toBeGreaterThan(100);
   }
   await page.screenshot({ path: info.outputPath('static-scene.png'), fullPage: true });
+  await page.reload();
+  await expect(page.locator('#projection-label')).toHaveText('ROBOT PERSPECTIVE');
+  await expect(page.locator('#robot-view')).toHaveAttribute('aria-pressed', 'true');
   await page.getByRole('button', { name: 'Stream connection' }).click();
   await page.getByLabel('Scene preview file').setInputFiles({ name: 'scene.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(scene)) });
   await expect(page.locator('#scene-status')).toContainText('scene.json: 400 points');
