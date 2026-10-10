@@ -1,0 +1,196 @@
+import * as THREE from 'three';
+import { cameraPose, cloudPositions, displayName, distance, vector } from './state.js';
+
+const colors = { yellow: 0xf4d06c, green: 0x91dc83, red: 0xff8877, purple: 0xd89fec, blue: 0x8cbafa };
+const hidden = o => o.state !== 'VISIBLE';
+
+export class RobotScene {
+  constructor(container, labels) {
+    this.container = container;
+    this.labels = labels;
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x151c1e);
+    this.camera = new THREE.PerspectiveCamera(66, 1, 0.01, 100);
+    this.camera.up.set(0, 0, 1);
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+    this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    container.append(this.renderer.domElement);
+    this.content = new THREE.Group();
+    this.scene.add(this.content);
+    this.labelItems = [];
+    this.observer = new ResizeObserver(() => this.resize());
+    this.observer.observe(container);
+    this.resize();
+    this.renderer.setAnimationLoop(() => this.render());
+  }
+
+  resize() {
+    this.dirty = true;
+    const { width, height } = this.container.getBoundingClientRect();
+    if (!width || !height) return;
+    this.camera.aspect = width / height;
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(width, height, false);
+  }
+
+  clear() {
+    this.dirty = true;
+    this.content.traverse(node => {
+      node.geometry?.dispose();
+      if (Array.isArray(node.material)) node.material.forEach(m => m.dispose());
+      else node.material?.dispose();
+    });
+    this.content.clear();
+    this.labels.replaceChildren();
+    this.labelItems = [];
+  }
+
+  points(positions, color, size, xray = false, opacity = 1) {
+    if (!positions.length) return;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    const material = new THREE.PointsMaterial({ color, size, transparent: true, opacity,
+      depthTest: !xray, depthWrite: !xray, sizeAttenuation: true });
+    const points = new THREE.Points(geometry, material);
+    points.renderOrder = xray ? 3 : 0;
+    this.content.add(points);
+  }
+
+  box(object, color, solid = false) {
+    const size = vector(object.size) ? object.size : [0.08, 0.08, 0.08];
+    const geometry = new THREE.BoxGeometry(...size.map(n => Math.max(0.005, n)));
+    if (solid) {
+      const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.12, depthWrite: false }));
+      mesh.position.fromArray(object.position);
+      this.content.add(mesh);
+    }
+    const edges = new THREE.EdgesGeometry(geometry);
+    if (!solid) geometry.dispose();
+    const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color, transparent: true, opacity: solid ? 0.3 : 0.7, depthTest: !hidden(object) }));
+    line.position.fromArray(object.position);
+    this.content.add(line);
+  }
+
+  label(object, selected) {
+    const el = document.createElement('div');
+    el.className = `object-label${hidden(object) ? ' hidden-object' : ''}${selected ? ' selected' : ''}`;
+    const title = document.createElement('span');
+    title.textContent = displayName(object);
+    const detail = document.createElement('small');
+    const meters = distance(this.pose.position, object.position).toFixed(2);
+    detail.textContent = `${meters} m / ${object.state === 'INSIDE' ? `inside cup ${object.inside}` : String(object.state || 'unknown').toLowerCase().replaceAll('_', ' ')}`;
+    el.append(title, detail);
+    this.labels.append(el);
+    const position = new THREE.Vector3(...object.position);
+    position.z += (object.size?.[2] || 0.065) * 0.7;
+    this.labelItems.push({ el, title, position, name: displayName(object), selected });
+  }
+
+  update(state, target) {
+    const pose = cameraPose(state.camera);
+    this.clear();
+    if (!pose) return { ready: false, clouds: false };
+    this.pose = pose;
+    this.camera.position.fromArray(pose.position);
+    const look = new THREE.Vector3(...pose.forward);
+    // OpenCV y points down. Preserve measured camera roll when a consistent
+    // transform is available; use world-up for legacy forward-only producers.
+    this.camera.up.set(0, 0, 1);
+    const t = state.camera.T_world_cam;
+    if (Array.isArray(t) && t.length === 12 && t.every(Number.isFinite)) {
+      const z = new THREE.Vector3(t[2], t[6], t[10]).normalize();
+      const up = new THREE.Vector3(-t[1], -t[5], -t[9]);
+      if (z.dot(look) > 0.99 && up.length() > 0.9) this.camera.up.copy(up.normalize());
+    }
+    this.camera.lookAt(this.camera.position.clone().add(look));
+    this.camera.updateMatrixWorld();
+
+    const floor = Number.isFinite(state.scene?.floor_z) ? state.scene.floor_z : 0;
+    const grid = new THREE.GridHelper(8, 40, 0x33463f, 0x27332f);
+    grid.rotation.x = Math.PI / 2;
+    grid.position.set(pose.position[0], pose.position[1], floor - 0.003);
+    grid.material.transparent = true;
+    grid.material.opacity = 0.38;
+    this.content.add(grid);
+    this.points(cloudPositions(state.scene?.point_cloud), 0x637b71, 0.003, false, 0.45);
+
+    for (const occluder of state.occluders) {
+      this.box(occluder, 0x9da99f, true);
+      this.points(cloudPositions(occluder.point_cloud, occluder.position), 0x9da99f, 0.0028, false, 0.5);
+    }
+    let clouds = false;
+    for (const object of [...state.objects, ...state.balls]) {
+      const selected = target?.id === object.id;
+      const color = colors[object.color] ?? (hidden(object) ? 0xf4d06c : 0x73e6d3);
+      const points = cloudPositions(object.point_cloud, object.position, 12000);
+      if (points.length) {
+        clouds = true;
+        this.points(points, color, object.color ? 0.0025 : 0.0019, hidden(object), hidden(object) ? 0.9 : 0.75);
+      } else this.box(object, color);
+      this.label(object, selected);
+    }
+    if (target) {
+      const origin = this.camera.position.clone().addScaledVector(look, 0.17);
+      const side = new THREE.Vector3().crossVectors(look, this.camera.up).normalize();
+      origin.addScaledVector(new THREE.Vector3().crossVectors(side, look).normalize(), -0.105);
+      const dest = new THREE.Vector3(...target.position);
+      const direction = dest.clone().sub(origin);
+      if (direction.length() > 0.02) {
+        const arrow = new THREE.ArrowHelper(direction.clone().normalize(), origin, Math.max(0.01, direction.length() - 0.06), 0xf4d06c, 0.025, 0.014);
+        arrow.line.material.transparent = true;
+        arrow.line.material.opacity = 0.65;
+        arrow.line.material.depthTest = false;
+        arrow.cone.material.depthTest = false;
+        arrow.renderOrder = 4;
+        this.content.add(arrow);
+      }
+    }
+    return { ready: true, clouds };
+  }
+
+  render() {
+    if (!this.dirty) return;
+    this.dirty = false;
+    this.renderer.render(this.scene, this.camera);
+    const width = this.container.clientWidth, height = this.container.clientHeight;
+    const placed = [];
+    for (const item of [...this.labelItems].sort((a, b) => Number(b.selected) - Number(a.selected))) {
+      const cameraSpace = item.position.clone().applyMatrix4(this.camera.matrixWorldInverse);
+      const projected = item.position.clone().project(this.camera);
+      const offscreen = cameraSpace.z >= 0 || Math.abs(projected.x) > 0.9 || Math.abs(projected.y) > 0.8;
+      let px = projected.x, py = projected.y;
+      if (offscreen) {
+        // Camera-space bearing remains well-defined for points behind the robot.
+        px = cameraSpace.x;
+        py = cameraSpace.y;
+        if (Math.abs(px) + Math.abs(py) < 1e-6) py = -1;
+        const scale = Math.max(Math.abs(px) / 0.72, Math.abs(py) / 0.65);
+        px /= scale; py /= scale;
+      }
+      item.el.classList.toggle('edge', offscreen);
+      const bearing = Math.abs(cameraSpace.x) > Math.abs(cameraSpace.y)
+        ? (cameraSpace.x < 0 ? '\u2190 ' : '\u2192 ')
+        : (cameraSpace.y > 0 ? '\u2191 ' : '\u2193 ');
+      item.title.textContent = `${offscreen ? bearing : ''}${item.name}`;
+      const preferredX = (px * .5 + .5) * width, preferredY = (-py * .5 + .5) * height;
+      const labelWidth = item.el.offsetWidth, labelHeight = item.el.offsetHeight;
+      let spot;
+      for (const dy of [0, -44, 44, -88, 88, -132, 132]) {
+        for (const dx of [0, -120, 120, -60, 60]) {
+          const x = THREE.MathUtils.clamp(preferredX + dx, labelWidth / 2 + 12, width - labelWidth / 2 - 12);
+          const y = THREE.MathUtils.clamp(preferredY + dy, 58 + labelHeight, height - 45);
+          const rect = { left: x - labelWidth / 2, right: x + labelWidth / 2, top: y - labelHeight, bottom: y };
+          if (placed.every(p => rect.right + 7 < p.left || rect.left - 7 > p.right || rect.bottom + 7 < p.top || rect.top - 7 > p.bottom)) {
+            spot = { x, y, rect }; break;
+          }
+        }
+        if (spot) break;
+      }
+      item.el.style.visibility = spot ? 'visible' : 'hidden';
+      if (spot) {
+        placed.push(spot.rect);
+        item.el.style.left = `${spot.x}px`; item.el.style.top = `${spot.y}px`;
+      }
+    }
+  }
+}
