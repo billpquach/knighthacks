@@ -12,6 +12,8 @@ Endpoints, CORS on all (the same as replay_server.py, so the viewer and every cl
                     old ones (a small send buffer, so nothing queues up); ?cloud=0 leaves out the point clouds
     /state.json     the newest state message (?cloud=0 as above)
     /frame.jpg      the newest x-ray image (JPEG); ?after=SEQ waits up to 2 s for a newer one; X-Seq, X-Age-Ms headers
+    /stream.mjpg    the x-ray view as an MJPEG stream (<img src=".../stream.mjpg">): no round trip per frame, so it
+                    keeps up over a slow, far link; like /state, fewer frames there, never old ones
     /scene          the scan: table, coloured cloud, and each object's twin (for the viewer's 3D view)
     /metrics        the Jetson's resource use (core/jetson)
     /viewer-info    {"mode": "live"}
@@ -71,6 +73,8 @@ BALL_BGR = {"red": (40, 40, 230), "yellow": (40, 215, 250), "green": (60, 200, 6
 TEXT = (235, 245, 250)
 CYAN = (255, 220, 0)
 AMBER = (40, 190, 255)
+PHONE_TIP = ("Keep Record3D open and streaming, and the iPhone awake (Settings > Display & Brightness > Auto-Lock > "
+             "Never); don't restart Record3D between the scan and tracking")
 
 
 # ---------------------------------------------------------------------------------------- serving
@@ -193,6 +197,29 @@ def handler(server):
                     self.send_error(503, "No frame yet")
                     return
                 self.body(jpg, "image/jpeg", extra=[("X-Seq", str(seq)), ("X-Age-Ms", str(int(1000 * (time.time() - stamp))))])
+            elif path == "/stream.mjpg":                # the x-ray view as a video: no round trip per frame
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                try:
+                    self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024)   # never old frames
+                    self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
+                seq = None
+                try:
+                    while True:
+                        with server.cond:
+                            server.cond.wait_for(lambda: server.jpg is not None and server.seq != seq, timeout=2.0)
+                            jpg, seq = server.jpg, server.seq
+                        if jpg is None:
+                            continue
+                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(jpg)
+                                         + jpg + b"\r\n")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                    return
             elif path == "/scene":
                 if server.scene is None:
                     self.send_error(404, "No scene yet")
@@ -431,6 +458,14 @@ class Qwen:
     def ready(self):
         return (self.folder / "ready").exists()
 
+    def note(self, *starts, last=1):
+        """The server's last log line(s) starting with one of `starts` (all lines if none), joined by " | "."""
+        try:
+            lines = (self.folder / "qwen.log").read_text(errors="ignore").splitlines()
+        except OSError:
+            return ""
+        return " | ".join([ln for ln in lines if not starts or ln.startswith(starts)][-last:])
+
     def alive(self):
         return self.proc.poll() is None
 
@@ -466,11 +501,16 @@ def camera_block(T):
     return dict(position=tk.r4(T[:3, 3]), forward=tk.r4(T[:3, 2]), T_world_cam=np.round(T[:3].reshape(-1), 5).tolist())
 
 
-def answer_points(folder, a):
-    """An answer's dense cloud (<slug>_refined.ply, written by the server), or None."""
+def answer_points(folder, a, min_points=30):
+    """An answer's cloud and which one: its dense cloud (<slug>_refined.ply), else Qwen-3D's own (<slug>.ply),
+    else just its centre (both written by the server; a cloud of fewer than min_points doesn't count)."""
     from ground3d.show import read_ply, slug
-    ply = Path(folder) / f"{slug(a['query'])}_refined.ply"
-    return read_ply(ply) if ply.exists() else None
+    for name, which in ((f"{slug(a['query'])}_refined.ply", "refined"), (f"{slug(a['query'])}.ply", "raw")):
+        ply = Path(folder) / name
+        pts = read_ply(ply) if ply.exists() else ()
+        if len(pts) >= min_points:
+            return pts, which
+    return np.asarray([a["center"]], float), "centre"
 
 
 def ask_phase(qwen, scan, server, frames, log=print):
@@ -492,9 +532,16 @@ def ask_phase(qwen, scan, server, frames, log=print):
             if res.get("error") or not a.get("center"):
                 log(f"Qwen-3D: '{text}': {res.get('error') or 'nothing found'}")
             else:
-                point = (a.get("refined") or {}).get("center") or a["center"]
-                answers.append(dict(a, point=point, points=answer_points(qwen.folder, a), ram_gb=res.get("ram_gb")))
-                log(f"Qwen-3D: '{text}' -> score {a['score']:.2f} ({a['band']}) at {tk.r4(point)}, {a['seconds']:.1f} s")
+                ref = a.get("refined") or {}
+                pts, which = answer_points(qwen.folder, a)
+                good = which == "refined"                   # (the dense cloud's centre and size, if it is one)
+                point = ref.get("center") if good else a["center"]
+                answers.append(dict(a, point=point, points=pts, which=which, size=ref.get("size") if good else a.get("size"),
+                                    ram_gb=res.get("ram_gb")))
+                why = ref.get("error") or f"{ref.get('n_points', 0)} points near the answer"
+                log(f"Qwen-3D: '{text}' -> score {a['score']:.2f} ({a['band']}) at {tk.r4(point)}, {a['seconds']:.1f} s; "
+                    f"{which} cloud, {len(pts)} points" + (f" (dense cloud: {why})" if which != "refined" and why else "")
+                    + (f"; RAM {res['ram_gb']} GB" if res.get("ram_gb") else ""))
             busy[0] = None
 
     if sys.stdin is not None and sys.stdin.isatty():    # typed questions (a "| tee" keeps the keyboard)
@@ -506,8 +553,15 @@ def ask_phase(qwen, scan, server, frames, log=print):
     worker = threading.Thread(target=work, daemon=True)
     worker.start()
     log('ASK: type a question (or POST /prompt {"text": ...}); "go" starts tracking')
-    go, last = False, None
+    go, last, said, shown = False, None, None, 0.0
     for f in frames:
+        if said is None and qwen.ready():               # the console says so too, with the load time and memory
+            said = True
+            log(f"Qwen-3D ready, {time.time() - qwen.t0:.0f} s after the start ({qwen.note('loaded in', 'READY', last=2)})")
+        elif said is None and not qwen.alive():
+            said = False
+            log(f"Qwen-3D stopped before it was ready; the end of {qwen.folder / 'qwen.log'}:\n  "
+                + qwen.note(last=8).replace(" | ", "\n  "))
         while not go:
             try:
                 text = server.prompts.get_nowait()
@@ -523,13 +577,22 @@ def ask_phase(qwen, scan, server, frames, log=print):
                 tag(img, "go: Qwen-3D exits, YOLOE tracking starts", (img.shape[1] // 2, img.shape[0] - 24), AMBER, 0.6)
                 server.publish(img, dict(msg, phase="starting", qwen=dict(msg["qwen"], status="done")))
             break
+        if time.monotonic() - shown < 1 / 15:           # the phone sends 60 a second: 15 leave the CPU to Qwen-3D
+            continue
+        shown = time.monotonic()
         img = cv2.cvtColor(f.rgb, cv2.COLOR_RGB2BGR)
         objects = []
         for i, a in enumerate(list(answers)):
             newest = i == len(answers) - 1
             info = {"label_xy": None}
-            pts = a["points"] if a["points"] is not None else np.zeros((0, 3))
-            if len(pts):
+            pts = a["points"]
+            if a["which"] == "centre":                  # no cloud: a ring where the answer is
+                u, v, z = render.project(np.asarray([a["point"]], float), f.K, f.T)
+                if z[0] > 0.05:
+                    r = int(max(10, 0.05 * f.K[0, 0] / z[0]))
+                    cv2.circle(img, (int(u[0]), int(v[0])), r, AMBER if newest else TEXT, 2, cv2.LINE_AA)
+                    info = {"label_xy": (int(u[0]), int(v[0]) - r)}
+            elif len(pts):
                 info = render.draw_cloud(img, pts, f.K, f.T, f.depth, centre=a["point"], target=newest, order_seed=200 + i)
             if info["label_xy"]:
                 tag(img, f"'{a['query']}' {a['score']:.2f}", (info["label_xy"][0], info["label_xy"][1] - 8),
@@ -623,6 +686,10 @@ def main(argv=None):
     ap.add_argument("--live-cloud", type=int, default=1500, metavar="N",
                     help="points of each depth frame in the state messages, for the viewer's 3D view (0: none)")
     args = ap.parse_args(argv)
+    try:
+        sys.stdout.reconfigure(line_buffering=True)     # each line at once, in order, through a "| tee"
+    except (AttributeError, ValueError):
+        pass
     from xray import shell
     out = Path(args.out).expanduser()
     out.mkdir(parents=True, exist_ok=True)
@@ -662,6 +729,9 @@ def main(argv=None):
         try:
             answers = ask_phase(qwen, scan, server, in_world(frames_from(source, args.start, args.speed)))
         except KeyboardInterrupt:
+            answers = None
+        except RuntimeError as e:                       # the phone stopped
+            print(f"stopped: {e}. {PHONE_TIP}", flush=True)
             answers = None
         finally:
             qwen.stop()
@@ -825,6 +895,8 @@ def main(argv=None):
                     dropped[0] += 1
     except KeyboardInterrupt:
         pass
+    except RuntimeError as e:                           # the phone stopped
+        print(f"stopped: {e}. {PHONE_TIP}", flush=True)
     finally:                                            # every step guarded: the files must close, the process exit
         for q, th in ((out_q, threads[1]), (files_q, threads[2])):
             try:

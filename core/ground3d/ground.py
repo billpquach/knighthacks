@@ -350,6 +350,8 @@ def serve(g, jobs, parent, ram, args):
                 answers.append(r)
                 points.append(pts)
                 print(describe(r), flush=True)
+                if len(pts):                                # Qwen-3D's own cloud: drawn if the dense one fails
+                    write_ply(jobs / f"{slug(q)}.ply", pts)
             refine_answers(job["scan"], answers, points, out=jobs)
             res.update(answers=answers, target=answers[0])
         except Exception as e:                              # the live runner reads the error and falls back
