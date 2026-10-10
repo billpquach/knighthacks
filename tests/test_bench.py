@@ -156,6 +156,19 @@ class TestRuns(unittest.TestCase):
         self.assertTrue(all(r["checks"]["first_query_high"] for r in doc["runs"]))
         self.assertIn("--frames 10", " ".join(doc["runs"][1]["command"]))
 
+    def test_relative_out(self):
+        """--out relative to where bench.py is started, while the runner starts in its own folder."""
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            self.out = Path("out")
+            rc, text, doc = self.bench("--cases", str(self.cases))
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(rc, 0, text)
+        self.assertTrue(doc["runs"][0]["checks"]["finished"])
+        self.assertTrue((self.tmp / "out" / "results.json").exists())
+
     def test_oom_retry(self):
         rc, _, doc = self.bench("--cases", str(self.cases), mode="oom_retry")
         r = doc["runs"][0]

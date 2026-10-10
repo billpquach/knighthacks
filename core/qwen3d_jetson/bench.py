@@ -625,7 +625,7 @@ def main(argv=None):
         if missing:
             print(f"STOP: {j['scan']} is not a scan folder (no {', '.join(missing)}/)")
             return 2
-    out = Path(args.out)
+    out = Path(args.out).expanduser().resolve()           # absolute: the runner starts in its own folder
     print(f"{len(jobs)} run{'s' if len(jobs) != 1 else ''} (~2-3 min each: model load ~95 s, scene ~20 s, ~5 s per query):")
     for j in jobs:
         print(f"  {j['id']}: " + " ".join(shlex.quote(c) for c in command(j, args, out / j["id"] / "scan")))
