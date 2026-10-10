@@ -1,10 +1,10 @@
-Intelligent Spatial Awareness & Object Permanence
-(NVIDIA winners: {
-    Bill Quach
-    Isabelle Mathew
-    Sebastian Noel
+# Intelligent Spatial Awareness & Object Permanence
+Knight Hacks IX Hackathon Project
+Team:
+    Bill Quach,
+    Isabelle Mathew,
+    Sebastian Noel,
     Alejandro Jaimes
-})
 
 ## Robot viewer
 
