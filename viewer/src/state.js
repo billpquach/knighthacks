@@ -14,7 +14,7 @@ export function cameraPose(camera) {
   if (!camera || !vector(camera.position)) return null;
   let forward = camera.forward;
   const matrix = camera.T_world_cam;
-  if (!vector(forward) && Array.isArray(matrix) && matrix.length === 12) forward = [matrix[2], matrix[6], matrix[10]];
+  if (!vector(forward) && Array.isArray(matrix) && [12, 16].includes(matrix.length)) forward = [matrix[2], matrix[6], matrix[10]];
   if (!vector(forward) || Math.hypot(...forward) < 1e-6) return null;
   const length = Math.hypot(...forward);
   return { position: camera.position, forward: forward.map(v => v / length) };
@@ -22,7 +22,22 @@ export function cameraPose(camera) {
 
 export function resolveTarget(state, selectedId) {
   const all = [...state.objects, ...state.balls];
-  return all.find(o => String(o.id) === selectedId) ?? state.objects.find(o => o.id === state.target_id) ?? null;
+  return all.find(o => String(o.id) === selectedId) ?? state.objects.find(o => o.id === state.target_id)
+    ?? (state.target_id == null ? state.balls.find(o => o.color === 'yellow') : null) ?? null;
+}
+
+export function normalizeScene(raw) {
+  if (!raw || raw.version !== 1 || raw.frame !== 'world' || raw.up !== 'z' || raw.units !== 'm'
+      || !Array.isArray(raw.cloud?.points) || raw.cloud.points.length > 50000
+      || !raw.cloud.points.every(vector) || !Number.isFinite(raw.table?.z)
+      || !Array.isArray(raw.table.outline) || raw.table.outline.length > 50000
+      || !raw.table.outline.every(p => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite))
+      || !Array.isArray(raw.objects) || raw.objects.length > 2000
+      || !raw.objects.every(o => o && (typeof o.id === 'string' || Number.isFinite(o.id))
+        && vector(o.position) && Array.isArray(o.points) && o.points.length <= 2000 && o.points.every(vector))) {
+    throw new Error('Invalid scene: expected v1, world frame, z up, metres, at most 50k environment points and 2k points per object.');
+  }
+  return raw;
 }
 
 export function distance(a, b) { return Math.hypot(...a.map((v, i) => v - b[i])); }

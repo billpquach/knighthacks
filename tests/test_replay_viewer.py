@@ -2,6 +2,7 @@
 import json
 import threading
 import unittest
+from unittest.mock import Mock
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
@@ -77,6 +78,43 @@ class ReplayViewerTests(unittest.TestCase):
             self.assertEqual(error.exception.code, 404)
         finally:
             server.STATES = original
+
+    def test_static_scene_and_missing_scene(self):
+        original = server.SCENE
+        try:
+            server.SCENE = None
+            with self.assertRaises(HTTPError) as error:
+                urlopen(self.base + "/scene")
+            self.assertEqual(error.exception.code, 404)
+            self.assertEqual(error.exception.headers["Access-Control-Allow-Origin"], "*")
+            server.SCENE = {"version": 1, "frame": "world", "up": "z", "units": "m"}
+            with urlopen(self.base + "/scene") as response:
+                self.assertEqual(response.headers["Content-Type"], "application/json")
+                self.assertEqual(response.headers.get_all("Access-Control-Allow-Origin"), ["*"])
+                self.assertEqual(json.load(response), server.SCENE)
+        finally:
+            server.SCENE = original
+
+    def test_recorded_frame_index_validation_and_timing_headers(self):
+        original_states, original_track = server.STATES, server.TRACK
+        try:
+            server.STATES = [{'t': 10, 'objects': []}]
+            server.TRACK = Mock()
+            server.TRACK.state_index.return_value = 0
+            server.TRACK.enrich.side_effect = lambda state, index: dict(state, replay={'frame': 8, 'frame_t': 10.001})
+            server.TRACK.image.return_value = b'\xff\xd8test'
+            with urlopen(self.base + '/frame-raw.jpg?index=0') as response:
+                self.assertEqual(response.headers['X-State-Index'], '0')
+                self.assertEqual(response.headers['X-Seq'], '8')
+                self.assertEqual(response.headers['X-Frame-Time'], '10.001')
+                self.assertEqual(response.read(), b'\xff\xd8test')
+            self.assertTrue(server.TRACK.image.call_args.kwargs['raw'])
+            for index in ['-1', '1', 'nan', '0.5', '../color/0']:
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(self.base + '/frame.jpg?index=' + index)
+                self.assertEqual(error.exception.code, 400)
+        finally:
+            server.STATES, server.TRACK = original_states, original_track
 
 
 if __name__ == "__main__":

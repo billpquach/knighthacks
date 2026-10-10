@@ -67,6 +67,7 @@ test('legacy state uses bounding boxes and missing source shows offline state', 
   await page.goto('/');
   await expect(page.locator('#geometry-type')).toHaveText('BOUNDING BOXES');
   await expect(page.locator('#target-label')).toHaveText('Cup 42');
+  await page.getByRole('button', { name: 'Calibrated robot perspective' }).click();
   await expect(page.locator('.object-label.edge')).toBeVisible();
   await page.getByRole('button', { name: 'Stream connection' }).click();
   await page.getByLabel('Robot URL').fill('http://127.0.0.1:1');

@@ -16,6 +16,10 @@
       <div class="toolbar">
         <div class="view-title">Spatial awareness <span id="phase">WAITING</span></div>
         <div class="view-controls">
+          <div class="segmented" role="group" aria-label="Spatial projection">
+            <button id="map-view" class="icon-button active" title="Memory map" aria-label="Memory map" aria-pressed="true"><i data-lucide="radar"></i></button>
+            <button id="robot-view" class="icon-button" title="Calibrated robot perspective" aria-label="Calibrated robot perspective" aria-pressed="false"><i data-lucide="navigation"></i></button>
+          </div>
           <div class="segmented" role="group" aria-label="View layout">
             <button data-layout="split" class="icon-button active" title="Split view" aria-label="Split view" aria-pressed="true"><i data-lucide="columns-2"></i></button>
             <button data-layout="spatial" class="icon-button" title="Spatial view with camera inset" aria-label="Spatial view with camera inset" aria-pressed="false"><i data-lucide="picture-in-picture-2"></i></button>
@@ -27,7 +31,7 @@
       <main id="workspace" data-layout="split">
         <section id="spatial-panel" aria-label="Robot perspective visualization">
           <div id="scene"></div><div id="labels"></div>
-          <div class="panel-heading"><i data-lucide="navigation"></i><span>ROBOT PERSPECTIVE</span><span id="geometry-type" class="panel-tag">WAITING</span></div>
+          <div class="panel-heading"><i data-lucide="navigation"></i><span id="projection-label">MEMORY MAP</span><span id="geometry-type" class="panel-tag">WAITING</span></div>
           <div id="scene-empty" class="empty-state"><i data-lucide="scan"></i><span>Waiting for robot state</span></div>
           <div class="scene-bottom"><div class="legend"><span><b class="cyan"></b>Observed</span><span><b class="yellow"></b>Remembered</span><span><b class="gray"></b>Environment</span></div><span class="units">METERS / Z UP</span></div>
         </section>
@@ -51,6 +55,8 @@
         <div class="dialog-heading"><h2>Stream connection</h2><button type="button" id="close-dialog" class="icon-button" aria-label="Close connection settings" title="Close"><i data-lucide="x"></i></button></div>
         <label for="stream-url">Robot URL</label><input id="stream-url" type="url" placeholder="http://192.168.55.1:8080" required />
         <label for="frame-path">Front camera endpoint</label><input id="frame-path" value="/frame.jpg" required />
+        <label for="scene-file">Scene preview file</label><input id="scene-file" type="file" accept=".json,application/json" />
+        <p id="scene-status" role="status">No static scene</p>
         <p id="connection-error" role="alert"></p>
         <div class="dialog-actions"><button type="button" id="local-source" class="text-button">Local source</button><button type="submit" class="primary-button"><i data-lucide="plug"></i>Connect</button></div>
       </form>

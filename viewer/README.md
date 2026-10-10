@@ -2,7 +2,8 @@
 
 A local Three.js viewer for the Jetson's `/state` SSE stream (or `/state.json`, the newest
 state once) and `/frame.jpg` x-ray camera feed. The default port is **8080**, defined in `replay_server.py`.
-The interface supports split view, spatial view with camera inset, and camera
+The default spatial view is a top-down memory map; the navigation control switches
+to calibrated robot perspective. The interface supports split view, spatial view with camera inset, and camera
 view with spatial inset. Select an object to inspect its bearing and distance;
 selection is local to the viewer and never commands the rover.
 
@@ -24,9 +25,11 @@ Open `http://localhost:8080`. The replay server serves the built frontend and
 simulated telemetry plus matching synthetic camera images. SIMULATION remains
 visible throughout: these are generated fixtures, not captured robot data.
 If 8080 is occupied, pass another port and open that address.
+The server binds to loopback by default. Add `--host 0.0.0.0` only when deliberately
+sharing with LAN clients; this exposes the recording and allows cross-origin reads.
 
 For hot reload, leave the replay server running and execute `npm run dev` in
-`viewer/`. Vite proxies the three stream endpoints to local port 8080.
+`viewer/`. Vite proxies the stream and scene endpoints to local port 8080.
 Dependencies are bundled at build time; runtime requires no CDN or external
 fonts. No cloud deployment is involved.
 
@@ -39,7 +42,7 @@ does not need `/viewer-info`; that optional endpoint labels local replay.
 
 The browser must reach the source over the LAN, hotspot, or Tailscale. For a
 viewer hosted on a different origin, the Jetson must allow CORS on `/state`,
-`/state.json` and `/frame.jpg` (the replay server allows any origin on every
+`/state.json`, `/scene` and `/frame.jpg` (the replay server allows any origin on every
 response). To read image timing headers, also send:
 
 ```text
@@ -64,52 +67,42 @@ to the latest state. The page does not save frames or recordings.
 The state contract is supported: world coordinates in meters, z up,
 `camera.position`, `camera.forward` (or row-major 3x4 `T_world_cam`), `objects[]`,
 `target_id`, and `ball`, including nested `ball.balls[]`. IDs are looked up by
-value, never used as array indices. Camera pose drives the actual 3D viewpoint.
-No supplied camera intrinsics are assumed, so the visualization uses a 66-degree
-vertical field of view rather than claiming pixel registration with the image.
+value, never used as array indices. When `target_id` is null after reveal, the
+arrow falls back to the yellow ball. An explicit local selection overrides that.
 
-The documented original stream has object centers and sizes but **does not
-provide point clouds or scene occluders**. Without them, the viewer draws
-explicitly labeled BOUNDING BOXES. It cannot infer an unseen wall from a target's
-OCCLUDED state. The following optional, additive fields are proposed by this
-viewer and still need to be emitted by the Jetson's perception server:
+`GET /scene` supplies static geometry once at connection and again on a phase
+transition to `track`. A missing endpoint leaves the state-only viewer functional.
+Connection settings also accept a local scene JSON file, overriding server scene
+loads until the next connection. The scene must use the same world as the states.
 
 ```json
 {
-  "objects": [{
-    "id": 42,
-    "label": "solo cup",
-    "state": "OCCLUDED",
-    "position": [0.5, 0.7, 0.75],
-    "size": [0.1, 0.1, 0.11],
-    "point_cloud": {
-      "frame": "object",
-      "points": [[0.01, 0.02, 0.03], [-0.01, 0.02, 0.03]]
-    }
-  }],
-  "scene": {
-    "floor_z": 0.70,
-    "point_cloud": {"frame": "world", "points": [[0.1, 0.2, 0.70]]}
-  },
-  "occluders": [{
-    "id": "box-1",
-    "label": "box",
-    "position": [0.5, 0.7, 0.8],
-    "size": [0.2, 0.2, 0.2]
-  }]
+  "version": 1, "frame": "world", "up": "z", "units": "m",
+  "table": {"z": 0.67, "outline": [[0, 0], [1, 0], [1, 1]]},
+  "cloud": {"points": [[0.1, 0.2, 0.67]], "colors": [[120, 160, 140]]},
+  "objects": [{"id": 42, "label": "solo cup", "position": [0.5, 0.7, 0.73], "points": []}]
 }
 ```
 
-`point_cloud` may also appear on each ball and occluder. Points must be finite
-XYZ triples. `frame: "world"` uses absolute scan coordinates; `frame: "object"`
-adds the object's position and assumes world-aligned axes (no implicit rotation).
-Clouds with unspecified frames are ignored. Client point budgets are 12k per
-tracked object and 50k per environment cloud; the producer should downsample
-before transmission. The grid is a reference plane, not measured LiDAR.
+The environment is capped at 50k world-space points, with RGB bytes preserved
+in the file but rendered dim grey-green. Object models are capped at 2k
+translation-only offsets per object: IDs select the model, and the latest state
+position translates it. Empty models render bounding boxes; the exporter does
+not fabricate cup models. Tracked geometry is drawn on top of the static scan.
+Static scan cups remain at their original locations when objects move.
+Modeled occluders and live per-frame clouds are out of scope. The synthetic demo's
+older optional geometry fields remain supported. The grid is only a reference.
 
-Remembered objects are drawn through supplied occluders. An arrow points toward
-the selected target; off-screen objects get directional edge labels. Unknown
-target IDs are harmless. Color, containment, and object state come from telemetry.
+Robot perspective uses `T_world_cam` with its y/z axes negated, without rotating
+the world. The calibrated image is letterboxed to preserve its aspect ratio.
+Optional `camera` on a scene (and `camera.intrinsics` on a state) accepts
+`{width,height,fx,fy,cx,cy}`; state intrinsics take precedence. The exporter records
+the first scan frame's lens. With no supplied lens, the G8 handoff calibration is
+480x640, fx=fy=452, cx=240.7, cy=319.6. Other cameras must supply their own lens.
+With `--track`, replay supplies each matched recorded frame's own pose and
+intrinsics. This avoids using scan-time calibration or rounded stream poses for
+camera registration. G8 camera/scene correspondence has been visually checked;
+the static scan does not follow cups that move during tracking.
 
 ## Recorded replay
 
@@ -120,13 +113,47 @@ target IDs are harmless. Color, containment, and object state come from telemetr
 JSONL is looped at 5 Hz with a REPLAY label. Camera images are unavailable for
 state-only recordings: `/frame.jpg` returns 404 instead of displaying unrelated
 synthetic frames. Multiple clients use the same elapsed-time frame index.
-No real recording or Jetson was available during initial implementation.
+For full-rate G8 states, pass `--hz 15`. State-only playback uses fixed cadence.
+With a track folder, recorded timestamps drive playback, looping at the recording
+duration; `--hz` controls SSE delivery frequency, not playback speed. MP4 import
+is not implemented.
+
+Export and replay a private scan (never put recordings or generated scenes in Git):
+
+```bash
+.venv/bin/python viewer/tools/scene_export.py /private/G8/scan /private/G8/scene.json \
+  --states docs/sample_state_G8.jsonl
+.venv/bin/python replay_server.py docs/sample_state_G8.jsonl \
+  --scene /private/G8/scene.json --port 8080
+# Full-rate states with timestamp-matched camera frames:
+.venv/bin/python replay_server.py /private/G8/states.jsonl --hz 15 \
+  --scene /private/G8/scene.json --track /private/G8/track --port 8080
+```
+
+Track folders use the same RGB/intrinsic/pose/meta format as `xray.frames`.
+Each state must match a frame within 50 ms; invalid timing or missing calibration
+fails startup. `/frame.jpg?index=N` returns recorded RGB with a reconstructed
+telemetry x-ray overlay for state index N; `/frame-raw.jpg?index=N` returns the
+original JPEG. This is labeled REPLAY OVERLAY, not a recorded production overlay.
+Select `/frame-raw.jpg` in connection settings to inspect unmodified RGB.
+`X-State-Index` and `X-Frame-Time` expose synchronization. The browser waits for
+the image to decode before committing its matching 3D state, including across
+freeze/resume and loop boundaries. A missing image holds that paired display
+and reports the camera error rather than pairing stale imagery with newer poses.
+
+The exporter reuses `xray.frames`: every keyframe, every third pixel in each axis,
+confidence 2, depth strictly between 0 and 3 m, one RGB sample per 1.5 cm voxel.
+Table height is the peak 2 cm histogram bin between 0.4 and 1.2 m; outline is the
+XY convex hull of points within 2 cm of that height. This simple estimator may
+include other surfaces at the same height. Models are seeded from the first state
+with empty point arrays for the tracker to fill later.
 
 ## Verification
 
 ```bash
 # Repository root
 .venv/bin/python -m unittest discover -s tests -p test_replay_viewer.py -v
+.venv/bin/python -m unittest discover -s tests -p test_scene_export.py -v
 # viewer/
 npm test
 npm run build
@@ -134,7 +161,7 @@ npx playwright install chromium
 npm run test:browser
 ```
 
-Browser tests require the replay server on 8080. Override `VIEWER_URL` or
+Browser tests require a synthetic replay server on 8080 (no state file). Override `VIEWER_URL` or
 `CHROMIUM_PATH` for an existing server/browser. They cover desktop/mobile layout,
 nonblank moving WebGL pixels, camera loading, target selection, freeze/resume,
 source validation, legacy geometry, off-screen arrows, and offline state.
