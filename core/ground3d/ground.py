@@ -7,9 +7,10 @@
 
 Run from core/, with the venv that has torch (CUDA), transformers 4.51.1 and accelerate. It needs:
   --upstream   the Qwen-3D code: git clone https://github.com/ll220/qwen3d ~/qwen3d
-  --weights    the model's safetensors + config.json (default ~/qwen3d_jetson_test/qwen)
-  --heads      the trained connector + mask decoder weights (default ~/qwen3d_jetson_test/heads.pth)
-  --processor  the Qwen2.5-VL processor files (default ~/qwen3d_jetson_test/processor)
+  --models     a folder with the model's files (default ~/models/qwen3d):
+                 qwen/       its safetensors + config.json
+                 heads.pth   the trained connector + mask decoder weights
+                 processor/  the Qwen2.5-VL processor files
 
 Memory plan for the 8 GB board: 8-bit language model, ViT and embedding table (quant.py); the ViT is
 unloaded once the scan is encoded; 15 frames, or 10 if 15 runs out of memory (the ViT is still there then).
@@ -129,6 +130,7 @@ class Grounder:
         self.heads = self._heads(heads)
         self.timing["load"] = round(time.time() - t, 1)
         self.scene = self.voxel_feats = None
+        self.retries = []                                    # out-of-memory retries during prepare()
 
     def _heads(self, path):
         """The parts upstream trains on top of the language model: two projections to the decoder width
@@ -178,6 +180,7 @@ class Grounder:
                 err = str(e).splitlines()[0][:120]
             sc = feats = fc = None                      # (outside the except: the traceback's tensors are gone)
             free_memory()
+            self.retries.append(dict(frames=n, retry_frames=tries[i + 1], error=err))
             self.log(f"out of memory with {n} frames ({err}); retrying with {tries[i + 1]}")
         self.model.visual = None
         sc.pixel_values = None
@@ -324,10 +327,11 @@ def main(argv=None):
     ap.add_argument("--parent", type=int, help="with --serve: exit if this process ends first")
     ap.add_argument("--frames", type=int, default=15)
     ap.add_argument("--max-depth", type=float, default=3.0)
-    ap.add_argument("--upstream", default=str(HOME / "qwen3d"))
-    ap.add_argument("--weights", default=str(HOME / "qwen3d_jetson_test" / "qwen"))
-    ap.add_argument("--heads", default=str(HOME / "qwen3d_jetson_test" / "heads.pth"))
-    ap.add_argument("--processor", default=str(HOME / "qwen3d_jetson_test" / "processor"))
+    ap.add_argument("--upstream", default=str(HOME / "qwen3d"), help="the Qwen-3D code checkout")
+    ap.add_argument("--models", default=str(HOME / "models" / "qwen3d"), help="folder with qwen/, heads.pth, processor/")
+    ap.add_argument("--weights", help="default: <models>/qwen")
+    ap.add_argument("--heads", help="default: <models>/heads.pth")
+    ap.add_argument("--processor", help="default: <models>/processor")
     ap.add_argument("--no-vit8", action="store_true", help="keep the ViT in bf16 (more memory)")
     ap.add_argument("--no-emb8", action="store_true", help="keep the embedding table in bf16 (more memory)")
     ap.add_argument("--device", default="cuda")
@@ -335,6 +339,10 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if not args.serve and not (args.scan and args.query):
         ap.error("give a scan folder and -q queries, or --serve JOBS")
+    models = Path(args.models).expanduser()
+    args.weights = args.weights or str(models / "qwen")
+    args.heads = args.heads or str(models / "heads.pth")
+    args.processor = args.processor or str(models / "processor")
     if args.device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("torch has no CUDA here (on the Jetson: the JetPack torch wheel, and the venv activated)")
     ram = Ram()
@@ -346,46 +354,64 @@ def main(argv=None):
         for f in ("job.json", "result.json", "ready"):
             (jobs / f).unlink(missing_ok=True)
         (jobs / "pid").write_text(str(os.getpid()))
-    print(f"torch {torch.__version__}, {torch.cuda.get_device_name() if args.device == 'cuda' else 'cpu'}, "
-          f"RAM in use {ram_idle:.2f} of {Ram.total():.2f} GB", flush=True)
-    g = Grounder(args.upstream, args.weights, args.heads, args.processor, args.device,
-                 vit8=not args.no_vit8, emb8=not args.no_emb8)
-    ram_loaded = ram.now
-    print(f"loaded in {g.timing['import'] + g.timing['load']:.0f} s, RAM in use {ram_loaded:.2f} GB", flush=True)
-    if jobs:
+        print(f"torch {torch.__version__}, RAM in use {ram_idle:.2f} of {Ram.total():.2f} GB", flush=True)
+        g = Grounder(args.upstream, args.weights, args.heads, args.processor, args.device,
+                     vit8=not args.no_vit8, emb8=not args.no_emb8)
+        print(f"loaded in {g.timing['import'] + g.timing['load']:.0f} s, RAM in use {ram.now:.2f} GB", flush=True)
         serve(g, jobs, args.parent, ram, args)
         return 0
 
+    # one shot: results.json is written whatever happens, so a benchmark can always read the outcome
     out = Path(args.out or f"runs/ground3d_{time.strftime('%H%M%S')}").expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
-    sc = g.prepare(args.scan, args.frames, args.max_depth)
-    print(f"scene: {len(sc.frames)} frames, {sc.grid[0]}x{sc.grid[1]} tokens each -> {sc.n_voxels} voxels, "
-          f"{len(sc.target_xyz)} target points; " + ", ".join(f"{k} {v:.1f} s" for k, v in sc.timing.items())
-          + f"; RAM in use {ram.now:.2f} GB", flush=True)
-    answers = []
-    for q in args.query:
-        r, pts = g.query(q)
-        if len(pts):
-            write_ply(out / f"{slug(q)}.ply", pts)
-        answers.append(r)
-        print("  " + describe(r), flush=True)
-    res = dict(scan=str(Path(args.scan).expanduser().resolve()), device=torch.cuda.get_device_name() if args.device == "cuda" else "cpu",
-               torch=torch.__version__, settings=dict(frames_asked=args.frames, vit8=not args.no_vit8, emb8=not args.no_emb8),
-               timing=dict(g.timing, scene={k: round(v, 2) for k, v in sc.timing.items()}),
-               frames=len(sc.frames), voxels=sc.n_voxels, target_points=len(sc.target_xyz),
-               ram_gb=dict(idle=round(ram_idle, 2), loaded=round(ram_loaded, 2), peak=round(ram.peak, 2), total=round(Ram.total(), 2)),
-               answers=answers)
+    res = dict(scan=str(Path(args.scan).expanduser().resolve()), queries=list(args.query), torch=torch.__version__,
+               device=torch.cuda.get_device_name() if args.device == "cuda" else "cpu",
+               settings=dict(frames_asked=args.frames, vit8=not args.no_vit8, emb8=not args.no_emb8),
+               answers=[], retries=[], error=None)
+    g = sc = None
+    ram_loaded = None
+    print(f"torch {torch.__version__}, {res['device']}, RAM in use {ram_idle:.2f} of {Ram.total():.2f} GB", flush=True)
+    try:
+        g = Grounder(args.upstream, args.weights, args.heads, args.processor, args.device,
+                     vit8=not args.no_vit8, emb8=not args.no_emb8)
+        ram_loaded = ram.now
+        print(f"loaded in {g.timing['import'] + g.timing['load']:.0f} s, RAM in use {ram_loaded:.2f} GB", flush=True)
+        sc = g.prepare(args.scan, args.frames, args.max_depth)
+        print(f"scene: {len(sc.frames)} frames, {sc.grid[0]}x{sc.grid[1]} tokens each -> {sc.n_voxels} voxels, "
+              f"{len(sc.target_xyz)} target points; " + ", ".join(f"{k} {v:.1f} s" for k, v in sc.timing.items())
+              + f"; RAM in use {ram.now:.2f} GB", flush=True)
+        for q in args.query:
+            r, pts = g.query(q)
+            if len(pts):
+                write_ply(out / f"{slug(q)}.ply", pts)
+            res["answers"].append(r)
+            print("  " + describe(r), flush=True)
+    except (Exception, SystemExit) as e:
+        msg = str(e).splitlines()[0][:300] if str(e) else type(e).__name__
+        res["error"] = ("OUT OF MEMORY: " if isinstance(e, Exception) and is_oom(e) else "") + f"{type(e).__name__}: {msg}"
+        print(f"FAILED: {res['error']}", flush=True)
+    if g is not None:
+        res["timing"] = dict(g.timing)
+        res["retries"] = list(g.retries)
+    if sc is not None:
+        res["timing"]["scene"] = {k: round(v, 2) for k, v in sc.timing.items()}
+        res.update(frames=len(sc.frames), voxels=sc.n_voxels, target_points=len(sc.target_xyz))
+    res["ram_gb"] = dict(idle=round(ram_idle, 2), loaded=None if ram_loaded is None else round(ram_loaded, 2),
+                         peak=round(ram.peak, 2), total=round(Ram.total(), 2))
     (out / "results.json").write_text(json.dumps(res, indent=2))
-    first = answers[0]
     print("\n=== GROUND3D SUMMARY (send me this) ===")
-    print(f"load {g.timing['import'] + g.timing['load']:.0f} s | scene {sc.timing['total']:.1f} s (ViT {sc.timing['vit']:.1f} s, "
-          f"{len(sc.frames)} frames, {sc.n_voxels} voxels) | first query {first['seconds']:.2f} s | "
-          f"INIT (scene + first query) {sc.timing['total'] + first['seconds']:.1f} s")
-    print(f"RAM in use: idle {ram_idle:.2f}, loaded {ram_loaded:.2f}, peak {ram.peak:.2f} of {Ram.total():.2f} GB")
-    for r in answers:
+    if res["error"]:
+        print(f"FAILED: {res['error']}")
+    if sc is not None and res["answers"]:
+        first = res["answers"][0]
+        print(f"load {g.timing['import'] + g.timing['load']:.0f} s | scene {sc.timing['total']:.1f} s (ViT {sc.timing['vit']:.1f} s, "
+              f"{len(sc.frames)} frames, {sc.n_voxels} voxels) | first query {first['seconds']:.2f} s | "
+              f"INIT (scene + first query) {sc.timing['total'] + first['seconds']:.1f} s")
+    print(f"RAM in use: idle {ram_idle:.2f}, loaded {res['ram_gb']['loaded']}, peak {ram.peak:.2f} of {Ram.total():.2f} GB")
+    for r in res["answers"]:
         print(describe(r))
     print(f"files: {out}/ (results.json, one .ply per answer)")
-    return 0
+    return 1 if res["error"] else 0
 
 
 if __name__ == "__main__":
