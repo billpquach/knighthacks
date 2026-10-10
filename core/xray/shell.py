@@ -9,8 +9,8 @@ a cup is lifted.
 
 Balls are told apart by colour, not by position: the hue of their saturated pixels (OpenCV hue, 0-180) against
 red 2, yellow 25, green 51, blue 108, purple 140; the scan's views give each ball its colour. The target is the
-yellow ball (else the first one); target_id is the cup holding it, null before it is hidden and after it is
-revealed. Per ball:
+yellow ball (else the first one); target_id is the cup holding it, null after it is revealed, and before it is
+first hidden the object chosen beforehand (Qwen-3D's answer), if any. Per ball:
   VISIBLE       a detection of its colour near where it was (with one ball, any colour)
   INSIDE        it went under a cup: unseen 2 frames while fully in view, with a cup's centre within the cup's
                 radius + 1.2 cm of it, that cup resting on the table (not lifted) and slower than 0.15 m/s. It
@@ -118,6 +118,8 @@ class ShellGame:
         self.events = []
         self.measurements = []
         self.t = None
+        self.chosen = None                          # a target picked before the game (Qwen-3D's answer), if any
+        self.hidden_once = False
         log(f"shell game: {len(self.balls)} balls ({', '.join(str(n) for n in names) or 'none'}), "
             f"target {self.target.id if self.target else 'none'}")
 
@@ -229,8 +231,12 @@ class ShellGame:
         for cup in self.cups():
             cup.extra = dict(has_ball=cup.id in held, balls_inside=sorted(held.get(cup.id, [])))
         self.tracker.others = [("ball", b.track.position) for b in self.balls if b.inside is None]
-        tgt = self.target
-        self.tracker.target_id = tgt.inside if tgt is not None else None
+        tgt = self.target                               # its cup; before it is first hidden, the chosen object
+        if tgt is not None and tgt.inside is not None:
+            self.hidden_once = True
+            self.tracker.target_id = tgt.inside
+        else:
+            self.tracker.target_id = None if self.hidden_once else self.chosen
         for cup in self.cups():
             cup.target = cup.id == self.tracker.target_id
 

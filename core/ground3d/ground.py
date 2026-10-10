@@ -2,7 +2,8 @@
 
     # one shot: load (~1.5 min), study the scan (~20 s), answer each query (~5 s), exit
     python -m ground3d.ground <scan> -q "the cup closest to the can" -q "the cup next to the ball"
-    # preloaded, for the live demo: load now, then answer one job (job.json in the folder) and exit
+    # preloaded, for the live demo: load now, then answer jobs (job.json in the folder; "more": true keeps it loaded
+    # for the next question) and exit (also when the folder gets a "stop" file); python -m xray.live --ask runs this
     python -m ground3d.ground --serve ~/ground_jobs [--parent PID]
 
 Run from core/, with the venv that has torch (CUDA), transformers 4.51.1 and accelerate. It needs:
@@ -292,6 +293,8 @@ def refine_answers(scan, answers, points, out=None, log=print):
     try:
         keyframes = refine_mod.load_keyframes(scan)
         table = refine_mod.table_height(keyframes)
+        if table is None:                                   # no table at table height: the objects stand on the floor
+            table = refine_mod.table_height(keyframes, lo=-0.15, hi=0.3)   # (or the scan saw only the table, at z = 0)
         # detector masks if the scan already has them cached (YOLOE is not loaded here: Qwen-3D holds the GPU)
         dets = refine_mod.scan_detections(scan, refine_mod.DEFAULT_PROMPT, use_detector=False, log=log)
     except Exception as e:
@@ -313,38 +316,50 @@ def refine_answers(scan, answers, points, out=None, log=print):
 
 
 def serve(g, jobs, parent, ram, args):
-    """Preloaded: wait for jobs/job.json ({"scan", "queries" or "query", "frames"}), answer it into
-    jobs/result.json, then exit so the memory is free for tracking."""
+    """Preloaded: answer jobs/job.json ({"scan", "queries" or "query", "frames", "more"}) into jobs/result.json. A job
+    with "more": true keeps it loaded for the next one (on the same scan, encoded once: the ViT is unloaded after the
+    first); otherwise, or as soon as jobs/stop appears, it exits so the memory is free for tracking."""
     (jobs / "ready").write_text(str(os.getpid()))
     print(f"READY ({ram.now:.2f} GB in use): waiting for {jobs / 'job.json'}", flush=True)
-    while not (jobs / "job.json").exists():
-        if parent and os.getppid() != parent:
-            (jobs / "ready").unlink(missing_ok=True)
-            sys.exit("the process that started this has ended: exiting to free the memory")
-        time.sleep(0.2)
-    time.sleep(0.1)
-    job = json.loads((jobs / "job.json").read_text())
-    (jobs / "job.json").rename(jobs / "job.taken")
-    t = time.time()
-    res = dict(scan=job["scan"])
-    try:
-        sc = g.prepare(job["scan"], int(job.get("frames", args.frames)), args.max_depth)
-        res.update(frames=len(sc.frames), voxels=sc.n_voxels, target_points=len(sc.target_xyz),
-                   scene_s={k: round(v, 2) for k, v in sc.timing.items()})
-        answers, points = [], []
-        for q in job.get("queries") or [job["query"]]:
-            r, pts = g.query(q)
-            answers.append(r)
-            points.append(pts)
-            print(describe(r), flush=True)
-        refine_answers(job["scan"], answers, points, out=jobs)
-        res.update(answers=answers, target=answers[0])
-    except Exception as e:                                  # the live runner reads the error and falls back
-        res["error"] = ("OUT OF MEMORY: " if is_oom(e) else "") + f"{type(e).__name__}: {str(e).splitlines()[0][:300]}"
-        print(res["error"], flush=True)
-    res.update(seconds_after_job=round(time.time() - t, 1), ram_peak_gb=round(ram.peak, 2))
-    (jobs / "result.tmp").write_text(json.dumps(res, indent=2))
-    (jobs / "result.tmp").rename(jobs / "result.json")
+    sc = scan = None
+    while True:
+        while not (jobs / "job.json").exists():
+            if (jobs / "stop").exists():
+                (jobs / "ready").unlink(missing_ok=True)
+                print("stop: exiting to free the memory", flush=True)
+                return
+            if parent and os.getppid() != parent:
+                (jobs / "ready").unlink(missing_ok=True)
+                sys.exit("the process that started this has ended: exiting to free the memory")
+            time.sleep(0.2)
+        time.sleep(0.1)
+        job = json.loads((jobs / "job.json").read_text())
+        (jobs / "job.json").rename(jobs / "job.taken")
+        t = time.time()
+        res = dict(scan=job["scan"])
+        try:
+            if sc is None:
+                sc, scan = g.prepare(job["scan"], int(job.get("frames", args.frames)), args.max_depth), job["scan"]
+            elif job["scan"] != scan:
+                raise RuntimeError(f"this load encoded {scan}; a new scan needs a new load")
+            res.update(frames=len(sc.frames), voxels=sc.n_voxels, target_points=len(sc.target_xyz),
+                       scene_s={k: round(v, 2) for k, v in sc.timing.items()})
+            answers, points = [], []
+            for q in job.get("queries") or [job["query"]]:
+                r, pts = g.query(q)
+                answers.append(r)
+                points.append(pts)
+                print(describe(r), flush=True)
+            refine_answers(job["scan"], answers, points, out=jobs)
+            res.update(answers=answers, target=answers[0])
+        except Exception as e:                              # the live runner reads the error and falls back
+            res["error"] = ("OUT OF MEMORY: " if is_oom(e) else "") + f"{type(e).__name__}: {str(e).splitlines()[0][:300]}"
+            print(res["error"], flush=True)
+        res.update(seconds_after_job=round(time.time() - t, 1), ram_peak_gb=round(ram.peak, 2), ram_gb=round(ram.now, 2))
+        (jobs / "result.tmp").write_text(json.dumps(res, indent=2))
+        (jobs / "result.tmp").rename(jobs / "result.json")
+        if not job.get("more"):
+            break
     (jobs / "ready").unlink(missing_ok=True)
 
 
@@ -352,7 +367,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Qwen-3D grounding on the Jetson (see the top of this file)")
     ap.add_argument("scan", nargs="?", help="scan folder")
     ap.add_argument("-q", "--query", action="append", default=[], help="a sentence; repeat -q; the first is the target")
-    ap.add_argument("--serve", metavar="JOBS", help="preload, answer one job from JOBS/job.json, exit")
+    ap.add_argument("--serve", metavar="JOBS", help="preload, answer jobs from JOBS/job.json, then exit")
     ap.add_argument("--parent", type=int, help="with --serve: exit if this process ends first")
     ap.add_argument("--frames", type=int, default=15)
     ap.add_argument("--max-depth", type=float, default=3.0)
@@ -381,7 +396,7 @@ def main(argv=None):
     jobs = Path(args.serve).expanduser() if args.serve else None
     if jobs:
         jobs.mkdir(parents=True, exist_ok=True)
-        for f in ("job.json", "result.json", "ready"):
+        for f in ("job.json", "result.json", "ready", "stop"):
             (jobs / f).unlink(missing_ok=True)
         (jobs / "pid").write_text(str(os.getpid()))
         print(f"torch {torch.__version__}, RAM in use {ram_idle:.2f} of {Ram.total():.2f} GB", flush=True)

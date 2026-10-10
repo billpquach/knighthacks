@@ -21,11 +21,14 @@ From `core/`, with the phone streaming over USB in Record3D:
 
 ```bash
 python -m xray.live --scan-seconds 20 --ball --video     # scan the table, then the shell game
+python -m xray.live --scan-seconds 20 --ask --ball --video 2>&1 | tee -i live.log   # Qwen-3D questions, then "go"
 python -m xray.live --scan <scan folder> --results <ground3d output>   # act 1: Qwen-3D's answer is the target
 ```
 
 It serves `/state`, `/state.json`, `/frame.jpg`, `/scene` and `/metrics` on port 8080 (the same endpoints as
-`replay_server.py`), plus the viewer at `/` once it is built. It writes `states.jsonl` (and with `--video` the
+`replay_server.py`), plus the viewer at `/` once it is built. With `--ask`, Qwen-3D loads while the phone scans;
+questions are typed in the console or sent with `curl -X POST <jetson>:8080/prompt -d 'the cup next to the ball'`,
+and `go` hands over to YOLOE tracking (Qwen-3D exits first, so its memory is free). It writes `states.jsonl` (and with `--video` the
 x-ray view) to `runs/live_<time>/`. To work from a recording instead of the phone:
 
 ```bash
