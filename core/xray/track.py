@@ -356,7 +356,7 @@ class Tracker:
             if tr.last_seen_t is None:                  # objects from the scan: seen at the start
                 tr.last_seen_t = tr.ok_t = t
             tr.predict(dt)
-        clean = rf.clean_pixels(frame.depth, frame.conf, stride=2)
+        clean = frame.clean = rf.clean_pixels(frame.depth, frame.conf, stride=2)      # (the shell game reuses it)
         radius = {tr.label: tr.radius for tr in self.tracks}
         ms = [measure(frame, d, clean, self.table_z, radius.get(d.label)) for d in drop_cups_on_balls(detections)
               if self.follows(d.label)]
@@ -450,20 +450,33 @@ class Tracker:
 
 
 # ---------------------------------------------------------------------------------------- the scene
+def support_height(keyframes, seeds):
+    """The height of the surface the objects stand on: the table (the most common height between 0.4 and 1.2 m), or
+    the floor (the most common height below 0.3 m, about 0 in the scan's world) when the objects are lower than the
+    table: on the floor, with a table somewhere else in the room."""
+    table = rf.table_height(keyframes)
+    low = float(np.median(np.concatenate(seeds)[:, 2])) if seeds else None
+    if low is not None and (table is None or low < table - 0.05):
+        floor = rf.table_height(keyframes, lo=-0.15, hi=0.3)
+        return 0.0 if floor is None else floor
+    return table
+
+
 def scan_objects(scan, prompt=rf.DEFAULT_PROMPT, use_detector=True, labels=None, min_score=0.3, min_views=3,
                  log=print):
     """The objects the tracker starts with: every object the detector finds (score >= min_score) in >= min_views
-    of the scan's keyframes, refined into its digital twin. One object seen from opposite sides can come out of
+    of the scan's keyframes, refined into its digital twin, standing on a table or on the floor (support_height). One object seen from opposite sides can come out of
     the detections as two (each view's centre is on its near side): twins of one label within 6 cm are one.
     Returns ([dict(label, position, size, points, views, score)], table height)."""
     keyframes = rf.load_keyframes(scan)
-    table = rf.table_height(keyframes)
     dets = rf.scan_detections(scan, prompt, use_detector, log)
     if dets is None:
         raise SystemExit(f"no detections for {scan}: the detector for \"{prompt}\" is needed (python -m xray.detect)")
     dets = [drop_cups_on_balls(ds) for ds in dets]
+    found = rf.objects_from_detections(keyframes, dets, min_score=min_score, min_views=1)
+    table = support_height(keyframes, [seed for _, seed, _, _ in found])
     out = []
-    for label, seed, views, score in rf.objects_from_detections(keyframes, dets, min_score=min_score, min_views=1):
+    for label, seed, views, score in found:
         if labels and label not in labels:
             continue
         r = rf.refine(seed, keyframes, table, label=label, dets=dets)

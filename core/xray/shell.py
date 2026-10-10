@@ -187,7 +187,9 @@ class ShellGame:
         t = frame.t
         dt = 1 / 15 if self.t is None else max(1e-3, t - self.t)
         self.t = t
-        clean = tk.rf.clean_pixels(frame.depth, frame.conf, stride=2)
+        clean = getattr(frame, "clean", None)                       # the tracker's, for this frame
+        if clean is None:
+            clean = tk.rf.clean_pixels(frame.depth, frame.conf, stride=2)
         ms = self.measure_balls(frame, detections, clean)
         self.measurements = ms
         self.watch_lifts(t)

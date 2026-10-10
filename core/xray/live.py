@@ -13,8 +13,13 @@ Endpoints, CORS on all (the same as replay_server.py, so the viewer and every cl
     /metrics        the Jetson's resource use (core/jetson)
     /viewer-info    {"mode": "live"}
     /               the viewer, once built (viewer/dist)
-Until tracking starts the messages are {"phase": "scan"} with no objects. Every message also goes to
-<out>/states.jsonl, and with --video the x-ray view to <out>/xray.mp4.
+Until tracking starts the messages are {"phase": "scan"} with no objects. Each message carries about 1500 points of
+the current depth frame (scene.point_cloud, for the viewer's live 3D view; --live-cloud 0: none). Every message also
+goes to <out>/states.jsonl (without the cloud); with --video the x-ray view to <out>/xray.mp4; with --record the raw frames to
+<out>/track, which --replay (or python -m xray.track) plays back.
+
+Three threads, so the frame rate is set by the slowest stage, not by all of them together: frames and detections;
+tracking, the game and the x-ray view; JPEG, serving, the log and the files.
 
 The scan and the tracking must share the phone's ARKit session (don't restart Record3D in between): live frames are
 put in the scan's world with its meta.json world_from_arkit. --results picks the target from Qwen-3D's first answer
@@ -26,7 +31,9 @@ through the cup; a tag on each object; status lines at the top, and the verdict 
 """
 import argparse
 import json
+import math
 import mimetypes
+import queue
 import os
 import sys
 import threading
@@ -166,11 +173,20 @@ def handler(server):
     return Handler
 
 
-def scene_json(scan, tracks):
-    """The /scene document: the scan (viewer/tools/scene_export.py) with each object's twin as offsets from it."""
+def scene_json(scan, tracks, cut=()):
+    """The /scene document: the scan (viewer/tools/scene_export.py) with each object's twin as offsets from it. The
+    scan's own copies of the objects (tracks and `cut`, where they stood when scanned) are taken out of the
+    environment cloud: objects move, and a copy left behind would be a ghost."""
     sys.path.insert(0, str(ROOT / "viewer" / "tools"))
     from scene_export import export_scene
     scene = export_scene(scan)
+    env, colours = np.asarray(scene["cloud"]["points"], float).reshape(-1, 3), scene["cloud"]["colors"]
+    keep = np.ones(len(env), bool)
+    for tr in list(tracks) + list(cut):
+        reach = np.hypot(*(env[:, :2] - tr.origin[:2]).T) < tr.radius + 0.02
+        top = tr.origin[2] + 0.6 * float(tr.size[2]) + 0.02
+        keep &= ~(reach & (env[:, 2] < top))
+    scene["cloud"] = dict(points=np.round(env[keep], 5).tolist(), colors=[c for c, k in zip(colours, keep) if k])
     scene["objects"] = []
     for tr in tracks:
         pts = np.zeros((0, 3)) if tr.points is None else \
@@ -228,9 +244,11 @@ def draw_view(img, frame, tracker, game=None, fps=None, verdict=None):
                 continue
             r = max(4, int(K[0, 0] * 0.032 / z[0]))
             c = (int(u[0]), int(v[0]))
-            glow = np.zeros_like(img)
-            cv2.circle(glow, c, r + 4, BALL_BGR.get(b.colour, BALL_BGR[None]), -1, cv2.LINE_AA)
-            img[:] = cv2.add(img, cv2.GaussianBlur(glow, (0, 0), 6))
+            pad = r + 24                                        # the glow: blurred disc, in a patch around it
+            x0, y0, x1, y1 = max(0, c[0] - pad), max(0, c[1] - pad), min(w, c[0] + pad), min(h, c[1] + pad)
+            glow = np.zeros((y1 - y0, x1 - x0, 3), np.uint8)
+            cv2.circle(glow, (c[0] - x0, c[1] - y0), r + 4, BALL_BGR.get(b.colour, BALL_BGR[None]), -1, cv2.LINE_AA)
+            img[y0:y1, x0:x1] = cv2.add(img[y0:y1, x0:x1], cv2.GaussianBlur(glow, (0, 0), 6))
             cv2.circle(img, c, r, BALL_BGR.get(b.colour, BALL_BGR[None]), -1, cv2.LINE_AA)
             cv2.circle(img, c, r, (255, 255, 255), 1, cv2.LINE_AA)
             tags.append((f"{b.id}: under cup {b.inside}", (c[0], c[1] + r + 16), BALL_BGR.get(b.colour, TEXT)))
@@ -329,6 +347,35 @@ def frames_from(source, start=None, speed=1.0):
             yield source.read()
 
 
+def live_cloud(f, n=1500, max_depth=3.0):
+    """About n of the frame's confident depth points (world, mm-rounded), for the viewer's live 3D view."""
+    ok = (f.conf == 2) & (f.depth > 0) & (f.depth < max_depth)
+    stride = max(1, int(math.sqrt(ok.sum() / max(n, 1))))
+    p = fr.backproject(f.depth, f.K, f.T, ok, stride)
+    if len(p) > n:
+        p = p[np.linspace(0, len(p) - 1, n).astype(int)]
+    return np.round(p, 3).tolist()
+
+
+class Recorder:
+    """Raw frames -> a track folder (the scan folder layout, in the scan's world) that xray.track / --replay read."""
+
+    def __init__(self, folder):
+        self.folder, self.n, self.times, self.size = Path(folder), 0, [], None
+
+    def add(self, f):
+        fr.write_frame(self.folder, self.n, f)
+        self.times.append(round(float(f.t), 4))
+        self.size = list(f.size)
+        self.n += 1
+
+    def close(self):
+        if self.n:
+            (self.folder / "meta.json").write_text(json.dumps(dict(
+                source="xray.live --record", num_frames=self.n, frame_times_s=self.times, image_size_wh=self.size,
+                keyframes=False, pose="camera-to-world, OpenCV camera (x right, y down, z forward), the scan's world")))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="The live x-ray (see the top of this file)")
     ap.add_argument("--scan", help="a scan folder of this phone session (else --scan-seconds scans first)")
@@ -343,6 +390,9 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--out", default=f"runs/live_{time.strftime('%H%M%S')}")
     ap.add_argument("--video", action="store_true", help="also write the x-ray view to <out>/xray.mp4")
+    ap.add_argument("--record", action="store_true", help="also save the raw frames to <out>/track (replayable)")
+    ap.add_argument("--live-cloud", type=int, default=1500, metavar="N",
+                    help="points of each depth frame in the state messages, for the viewer's 3D view (0: none)")
     args = ap.parse_args(argv)
     from xray import shell
     out = Path(args.out).expanduser()
@@ -385,20 +435,77 @@ def main(argv=None):
             tracker.target_id = None if tr is None else tr.id
             print(f"target: '{query}' -> {'none' if tr is None else f'{tr.label} {tr.id}'}", flush=True)
     try:
-        server.scene = scene_json(scan, tracker.tracks)
+        server.scene = scene_json(scan, tracker.tracks, cut=[b.track for b in game.balls] if game else ())
     except Exception as e:
         print(f"(no /scene: {e})")
     source = fr.FolderSource(args.replay) if args.replay else phone
     to_world = None if args.replay else world_from_phone(scan)
-    log = open(out / "states.jsonl", "w")
-    video, verdict, verdict_t, seen_verdicts = None, None, 0.0, set()
+    floor = 0.0                                         # the scan's world has the floor at z = 0
+    frames_q, out_q, stop = queue.Queue(maxsize=2), queue.Queue(maxsize=4), threading.Event()
+
+    def offer(q, item, newest=False):
+        """Put item on q; with newest, drop an item not yet taken instead of waiting (live: never fall behind)."""
+        while not stop.is_set():
+            if newest:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    pass
+            try:
+                q.put(item, timeout=0.5)
+                return
+            except queue.Full:
+                pass
+
+    def produce():                                      # thread 1: frames and their detections
+        try:
+            for f in frames_from(source, args.start, args.speed):
+                if stop.is_set():
+                    break
+                if to_world is not None:
+                    f.T = to_world @ f.T
+                dets = cached.get(source.ids[f.index], []) if cached is not None else detector(f.rgb)
+                offer(frames_q, (f, dets), newest=phone is not None)
+        except Exception as e:                          # handed to the main thread
+            offer(frames_q, e)
+        offer(frames_q, None)
+
+    record = Recorder(out / "track") if args.record else None
+
+    def output():                                       # thread 3: JPEG, the stream, the log, the video, the recording
+        video = None
+        with open(out / "states.jsonl", "w") as log:
+            while True:
+                item = out_q.get()
+                if item is None:
+                    break
+                img, msg, f = item
+                server.publish(img, msg)
+                log.write(json.dumps({k: v for k, v in msg.items() if k != "scene"}, separators=(",", ":")) + "\n")
+                if args.video:
+                    if video is None:
+                        video = cv2.VideoWriter(str(out / "xray.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 15,
+                                                (img.shape[1], img.shape[0]))
+                    video.write(img)
+                if record is not None:
+                    record.add(f)
+        if video is not None:
+            video.release()
+
+    threads = [threading.Thread(target=produce, daemon=True), threading.Thread(target=output, daemon=True)]
+    for th in threads:
+        th.start()
+    verdict, verdict_t, seen_verdicts = None, 0.0, set()
     fps, last = None, None
     print("tracking (Ctrl+C stops)", flush=True)
-    try:
-        for f in frames_from(source, args.start, args.speed):
-            if to_world is not None:
-                f.T = to_world @ f.T
-            dets = cached.get(source.ids[f.index], []) if cached is not None else detector(f.rgb)
+    try:                                                # main thread: tracking, the game, the view
+        while True:
+            item = frames_q.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            f, dets = item
             tracker.update(f, dets)
             if game is not None:
                 game.update(f, dets)
@@ -416,23 +523,26 @@ def main(argv=None):
                         verdict = (f"REVEAL {b.id}: cup {v['actual']}, we said cup {v['believed']}: "
                                    f"{'RIGHT' if v['right'] else 'WRONG'}")
                         verdict_t = f.t
+            if args.live_cloud:
+                msg["scene"] = dict(floor_z=floor, point_cloud=dict(frame="world", points=live_cloud(f, args.live_cloud)))
             img = draw_view(cv2.cvtColor(f.rgb, cv2.COLOR_RGB2BGR), f, tracker, game, fps,
                             verdict if verdict and f.t - verdict_t < 5 else None)
-            server.publish(img, msg)
-            log.write(json.dumps(msg, separators=(",", ":")) + "\n")
-            if args.video:
-                if video is None:
-                    video = cv2.VideoWriter(str(out / "xray.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 15, (img.shape[1], img.shape[0]))
-                video.write(img)
+            offer(out_q, (img, msg, f))
     except KeyboardInterrupt:
         pass
     finally:
-        log.close()
-        if video is not None:
-            video.release()
+        try:
+            out_q.put(None, timeout=5)
+        except queue.Full:
+            pass
+        threads[1].join(timeout=30)                     # let the log, video and recording finish
+        stop.set()
+        if record is not None:
+            record.close()
         if game is not None and game.events:
             print("events:\n" + "\n".join(f"  {t:6.2f} s  {e}" for t, e in game.events))
-        print(f"-> {out}/states.jsonl" + (" and xray.mp4" if video is not None else ""), flush=True)
+        print(f"-> {out}/states.jsonl" + (" and xray.mp4" if args.video else "")
+              + (f", {record.n} frames in track/" if record is not None else ""), flush=True)
         server.close()
         if metrics is not None:
             metrics.stop()
