@@ -1,10 +1,10 @@
-import { createIcons, ScanEye, Radio, Maximize, Columns2, PictureInPicture2, Camera, Pause, Play, Navigation, Scan, VideoOff, Layers3, X, Plug } from 'lucide';
+import { createIcons, ScanEye, Radio, Radar, Maximize, Columns2, PictureInPicture2, Camera, Pause, Play, Navigation, Scan, VideoOff, Layers3, X, Plug } from 'lucide';
 import { RobotScene } from './scene.js';
-import { normalizeState, resolveTarget, displayName, distance, sourceUrl, cameraPose } from './state.js';
+import { normalizeState, normalizeScene, resolveTarget, displayName, distance, sourceUrl, cameraPose } from './state.js';
 import './style.css';
 
 const $ = id => document.getElementById(id);
-const icons = { ScanEye, Radio, Maximize, Columns2, PictureInPicture2, Camera, Pause, Play, Navigation, Scan, VideoOff, Layers3, X, Plug };
+const icons = { ScanEye, Radio, Radar, Maximize, Columns2, PictureInPicture2, Camera, Pause, Play, Navigation, Scan, VideoOff, Layers3, X, Plug };
 const drawIcons = () => createIcons({ icons });
 drawIcons();
 
@@ -15,6 +15,53 @@ let state, target, selectedId = null, paused = false, source, events, generation
 let frameController, frameTimer, currentImageUrl, lastImageAt = 0, lastSeq = null, listKey = '';
 let mode = 'unknown', receivedValidState = false;
 let framePath = '/frame.jpg';
+let sceneRequest = 0, fileScene = false;
+let pendingState = null;
+
+function projection(view) {
+  scene?.setView(view);
+  $('projection-label').textContent = view === 'map' ? 'MEMORY MAP' : 'ROBOT PERSPECTIVE';
+  $('spatial-panel').setAttribute('aria-label', view === 'map' ? 'Top-down memory map' : 'Robot perspective visualization');
+  for (const [id, name] of [['map-view', 'map'], ['robot-view', 'robot']]) {
+    $(id).setAttribute('aria-pressed', String(view === name));
+    $(id).classList.toggle('active', view === name);
+  }
+}
+$('map-view').onclick = () => projection('map');
+$('robot-view').onclick = () => projection('robot');
+projection('map');
+
+async function fetchScene(token) {
+  if (fileScene) return;
+  const request = ++sceneRequest;
+  try {
+    const response = await fetch(`${source}/scene`, { cache: 'no-store', signal: AbortSignal.timeout(10000) });
+    if (!response.ok) throw new Error(response.status === 404 ? 'No static scene' : 'Scene unavailable');
+    const data = normalizeScene(await response.json());
+    if (token !== generation || request !== sceneRequest) return;
+    scene?.setScene(data);
+    $('scene-status').textContent = `${data.cloud.points.length.toLocaleString()} scan points`;
+    display();
+  } catch (error) {
+    if (token !== generation || request !== sceneRequest) return;
+    scene?.setScene(null);
+    $('scene-status').textContent = error.message;
+    display();
+  }
+}
+
+$('scene-file').onchange = async () => {
+  const file = $('scene-file').files[0];
+  if (!file) return;
+  const request = ++sceneRequest;
+  try {
+    if (file.size > 25 * 1024 * 1024) throw new Error('Scene file exceeds 25 MB');
+    const data = normalizeScene(JSON.parse(await file.text()));
+    if (request !== sceneRequest) return;
+    fileScene = true; scene?.setScene(data); display();
+    $('scene-status').textContent = `${file.name}: ${data.cloud.points.length.toLocaleString()} points`;
+  } catch (error) { $('scene-status').textContent = error.message; }
+};
 
 function stored(key, fallback) { try { return localStorage.getItem(key) || fallback; } catch { return fallback; } }
 function persist(key, value) { try { localStorage.setItem(key, value); } catch { /* Storage is optional. */ } }
@@ -42,6 +89,7 @@ function display() {
   if (!state || paused) return;
   target = resolveTarget(state, selectedId);
   const geometry = scene?.update(state, target);
+  $('spatial-panel').dataset.stateIndex = state.replay?.index ?? '';
   if (scene) {
     $('scene-empty').hidden = geometry.ready;
     $('scene-empty').querySelector('span').textContent = 'Waiting for camera pose';
@@ -80,11 +128,14 @@ async function pollFrame(token) {
   frameController = new AbortController();
   const timer = setTimeout(() => frameController?.abort(), 5000);
   let next = 100;
+  const snapshot = pendingState;
   try {
     const url = new URL(`${source}${framePath}`);
     url.searchParams.set('_', Date.now());
+    if (snapshot?.replay?.camera) url.searchParams.set('index', snapshot.replay.index);
     const response = await fetch(url, { cache: 'no-store', signal: frameController.signal });
     if (!response.ok || !response.headers.get('Content-Type')?.startsWith('image/')) throw new Error('Camera unavailable');
+    if (snapshot?.replay?.camera && response.headers.get('X-State-Index') !== String(snapshot.replay.index)) throw new Error('Camera synchronization mismatch');
     const blob = await response.blob();
     if (token !== generation || paused) return;
     const imageUrl = URL.createObjectURL(blob);
@@ -93,15 +144,17 @@ async function pollFrame(token) {
     if (token !== generation || paused) { URL.revokeObjectURL(imageUrl); return; }
     $('camera-frame').src = imageUrl;
     $('camera-frame').classList.add('ready');
+    $('camera-frame').dataset.stateIndex = response.headers.get('X-State-Index') ?? '';
     $('camera-empty').hidden = true;
     if (currentImageUrl) URL.revokeObjectURL(currentImageUrl);
     currentImageUrl = imageUrl;
+    if (snapshot?.replay?.camera) { state = snapshot; display(); }
     const seq = response.headers.get('X-Seq');
     if (seq === null || seq !== lastSeq) lastImageAt = performance.now();
     lastSeq = seq;
     $('frame-seq').textContent = `FRAME ${seq ?? '--'}`;
     const age = response.headers.get('X-Age-Ms');
-    $('frame-age').textContent = age === null ? 'Age unavailable' : `${age} ms`;
+    $('frame-age').textContent = snapshot?.replay?.camera ? `REC ${snapshot.replay.frame_t.toFixed(2)} s` : age === null ? 'Age unavailable' : `${age} ms`;
   } catch (error) {
     if (token !== generation) return;
     next = 1500;
@@ -116,11 +169,13 @@ async function pollFrame(token) {
 
 async function connect(url) {
   const token = ++generation;
+  ++sceneRequest; fileScene = false; $('scene-file').value = '';
   source = sourceUrl(url);
   events?.close(); clearTimeout(frameTimer); frameController?.abort();
   lastStateAt = 0; lastImageAt = 0; lastSeq = null; receivedValidState = false; selectedId = null;
-  state = null; listKey = ''; mode = 'unknown';
-  scene?.clear(); $('object-list').replaceChildren(); $('object-count').textContent = '0';
+  state = null; pendingState = null; listKey = ''; mode = 'unknown';
+  if (scene) { scene.lastState = null; scene.setScene(null); scene.clear(); }
+  $('object-list').replaceChildren(); $('object-count').textContent = '0';
   $('target-label').textContent = 'No target'; $('target-distance').textContent = '-- m'; $('target-state').textContent = 'Awaiting state';
   $('camera-frame').classList.remove('ready'); $('camera-frame').removeAttribute('src');
   if (currentImageUrl) URL.revokeObjectURL(currentImageUrl); currentImageUrl = null;
@@ -132,16 +187,21 @@ async function connect(url) {
   persist('robot-source', source); persist('robot-frame-path', framePath);
   status('CONNECTING');
   events = new EventSource(`${source}/state`);
+  fetchScene(token);
   events.onmessage = message => {
     if (token !== generation) return;
     try {
-      state = normalizeState(JSON.parse(message.data));
+      const previousPhase = pendingState?.phase;
+      pendingState = normalizeState(JSON.parse(message.data));
+      if (!pendingState.replay?.camera) state = pendingState;
+      if (pendingState.phase === 'track' && previousPhase !== 'track') fetchScene(token);
       lastStateAt = performance.now(); receivedValidState = true;
-      if (state.source === 'synthetic' || state.source === 'replay') mode = state.source;
+      if (pendingState.source === 'synthetic' || pendingState.source === 'replay') mode = pendingState.source;
       const label = mode === 'synthetic' ? 'SIMULATION' : mode === 'replay' ? 'REPLAY' : 'CONNECTED';
       status(paused ? 'FROZEN' : label, !paused);
       $('mode-label').textContent = label;
-      $('camera-type').textContent = mode === 'synthetic' ? 'SIMULATED' : mode === 'replay' ? 'NO RECORDING' : 'X-RAY';
+      $('camera-type').textContent = pendingState.replay?.camera ? (framePath === '/frame-raw.jpg' ? 'RECORDED RGB' : 'REPLAY OVERLAY') : mode === 'synthetic' ? 'SIMULATED' : mode === 'replay' ? 'NO RECORDING' : 'X-RAY';
+      $('camera-frame').alt = pendingState.replay?.camera ? 'Recorded front camera with replay telemetry' : 'Robot front camera with x-ray overlay';
       $('stream-detail').textContent = mode === 'synthetic' ? 'Local simulation' : mode === 'replay' ? 'Recorded telemetry' : 'Robot stream';
       $('stale-banner').hidden = true;
       display();

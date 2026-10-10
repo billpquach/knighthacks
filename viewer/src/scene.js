@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { cameraPose, cloudPositions, displayName, distance, vector } from './state.js';
+import { calibrate, G8_LENS, validLens } from './calibration.js';
 
 const colors = { yellow: 0xf4d06c, green: 0x91dc83, red: 0xff8877, purple: 0xd89fec, blue: 0x8cbafa };
 const hidden = o => o.state !== 'VISIBLE';
@@ -12,6 +13,12 @@ export class RobotScene {
     this.scene.background = new THREE.Color(0x151c1e);
     this.camera = new THREE.PerspectiveCamera(66, 1, 0.01, 100);
     this.camera.up.set(0, 0, 1);
+    this.perspective = this.camera;
+    this.mapCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, .01, 100);
+    this.view = 'map';
+    this.lens = G8_LENS;
+    this.environment = new THREE.Group();
+    this.scene.add(this.environment);
     this.renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
     this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     container.append(this.renderer.domElement);
@@ -28,9 +35,58 @@ export class RobotScene {
     this.dirty = true;
     const { width, height } = this.container.getBoundingClientRect();
     if (!width || !height) return;
-    this.camera.aspect = width / height;
-    this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height, false);
+    this.frameCamera(width, height);
+  }
+
+  frameCamera(width = this.container.clientWidth, height = this.container.clientHeight) {
+    if (!width || !height) return;
+    this.camera = this.view === 'map' ? this.mapCamera : this.perspective;
+    this.viewport = { x: 0, y: 0, width, height };
+    if (this.view === 'map') {
+      const bounds = this.mapBounds || new THREE.Box3(new THREE.Vector3(-1, -1, 0), new THREE.Vector3(1, 1, 1));
+      const center = bounds.getCenter(new THREE.Vector3());
+      const size = bounds.getSize(new THREE.Vector3());
+      const halfH = Math.max(size.y / 2, size.x / 2 * height / width, .4) * 1.5;
+      Object.assign(this.camera, { left: -halfH * width / height, right: halfH * width / height, top: halfH, bottom: -halfH });
+      this.camera.position.set(center.x, center.y, Math.max(bounds.max.z, 2) + 4);
+      this.camera.up.set(0, 1, 0);
+      this.camera.lookAt(center.x, center.y, 0);
+      this.camera.updateProjectionMatrix();
+      this.camera.updateMatrixWorld();
+    } else {
+      calibrate(this.camera, this.lens, this.lastState?.camera?.T_world_cam);
+      const scale = Math.min(width / this.lens.width, height / this.lens.height);
+      const w = this.lens.width * scale, h = this.lens.height * scale;
+      this.viewport = { x: (width - w) / 2, y: (height - h) / 2, width: w, height: h };
+    }
+  }
+
+  setView(view) {
+    this.view = view;
+    if (this.lastState) this.update(this.lastState, this.lastTarget);
+    this.resize();
+  }
+
+  setScene(data) {
+    this.environment.traverse(node => { node.geometry?.dispose(); node.material?.dispose(); });
+    this.environment.clear();
+    this.staticScene = data;
+    this.mapBounds = null;
+    this.lens = validLens(data?.camera) ? data.camera : G8_LENS;
+    if (data) {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(data.cloud.points.flat(), 3));
+      this.environment.add(new THREE.Points(geometry, new THREE.PointsMaterial({ color: 0x82998c,
+        size: .008, transparent: true, opacity: .48, depthWrite: false })));
+      const outline = data.table.outline.map(p => new THREE.Vector3(...p, data.table.z));
+      if (outline.length >= 3) this.environment.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(outline),
+        new THREE.LineBasicMaterial({ color: 0x99b5a1, transparent: true, opacity: .4 })));
+      if (outline.length) this.mapBounds = new THREE.Box3().setFromPoints(outline);
+      else if (data.cloud.points.length) this.mapBounds = new THREE.Box3().setFromBufferAttribute(geometry.attributes.position);
+    }
+    if (this.lastState) this.update(this.lastState, this.lastTarget);
+    this.resize();
   }
 
   clear() {
@@ -66,7 +122,8 @@ export class RobotScene {
     }
     const edges = new THREE.EdgesGeometry(geometry);
     if (!solid) geometry.dispose();
-    const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color, transparent: true, opacity: solid ? 0.3 : 0.7, depthTest: !hidden(object) }));
+    const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color, transparent: true, opacity: solid ? 0.3 : 0.7, depthTest: solid, depthWrite: false }));
+    line.renderOrder = 3;
     line.position.fromArray(object.position);
     this.content.add(line);
   }
@@ -87,10 +144,12 @@ export class RobotScene {
   }
 
   update(state, target) {
+    this.lastState = state; this.lastTarget = target;
     const pose = cameraPose(state.camera);
     this.clear();
     if (!pose) return { ready: false, clouds: false };
     this.pose = pose;
+    this.camera = this.perspective;
     this.camera.position.fromArray(pose.position);
     const look = new THREE.Vector3(...pose.forward);
     // OpenCV y points down. Preserve measured camera roll when a consistent
@@ -104,11 +163,16 @@ export class RobotScene {
     }
     this.camera.lookAt(this.camera.position.clone().add(look));
     this.camera.updateMatrixWorld();
+    this.lens = validLens(state.camera.intrinsics) ? state.camera.intrinsics
+      : validLens(this.staticScene?.camera) ? this.staticScene.camera : G8_LENS;
+    if (!this.mapBounds) this.mapBounds = new THREE.Box3().setFromPoints(
+      [...state.objects, ...state.balls, { position: pose.position }].map(o => new THREE.Vector3(...o.position)));
+    this.frameCamera();
 
     const floor = Number.isFinite(state.scene?.floor_z) ? state.scene.floor_z : 0;
     const grid = new THREE.GridHelper(8, 40, 0x33463f, 0x27332f);
     grid.rotation.x = Math.PI / 2;
-    grid.position.set(pose.position[0], pose.position[1], floor - 0.003);
+    grid.position.set(0, 0, floor - 0.003);
     grid.material.transparent = true;
     grid.material.opacity = 0.38;
     this.content.add(grid);
@@ -118,25 +182,27 @@ export class RobotScene {
       this.box(occluder, 0x9da99f, true);
       this.points(cloudPositions(occluder.point_cloud, occluder.position), 0x9da99f, 0.0028, false, 0.5);
     }
-    let clouds = false;
+    let clouds = !!this.staticScene?.cloud.points.length;
     for (const object of [...state.objects, ...state.balls]) {
       const selected = target?.id === object.id;
       const color = colors[object.color] ?? (hidden(object) ? 0xf4d06c : 0x73e6d3);
-      const points = cloudPositions(object.point_cloud, object.position, 12000);
+      const model = this.staticScene?.objects.find(o => o.id === object.id);
+      const points = cloudPositions(model?.points.length ? { frame: 'object', points: model.points } : object.point_cloud, object.position, 2000);
       if (points.length) {
         clouds = true;
-        this.points(points, color, object.color ? 0.0025 : 0.0019, hidden(object), hidden(object) ? 0.9 : 0.75);
+        this.points(points, color, object.color ? 0.0025 : 0.0019, true, hidden(object) ? 0.9 : 0.75);
       } else this.box(object, color);
       this.label(object, selected);
     }
     if (target) {
-      const origin = this.camera.position.clone().addScaledVector(look, 0.17);
+      const origin = new THREE.Vector3(...pose.position).addScaledVector(look, 0.17);
       const side = new THREE.Vector3().crossVectors(look, this.camera.up).normalize();
       origin.addScaledVector(new THREE.Vector3().crossVectors(side, look).normalize(), -0.105);
+      if (this.view === 'map') origin.fromArray(pose.position);
       const dest = new THREE.Vector3(...target.position);
       const direction = dest.clone().sub(origin);
       if (direction.length() > 0.02) {
-        const arrow = new THREE.ArrowHelper(direction.clone().normalize(), origin, Math.max(0.01, direction.length() - 0.06), 0xf4d06c, 0.025, 0.014);
+        const arrow = new THREE.ArrowHelper(direction.clone().normalize(), origin, direction.length(), 0xf4d06c, 0.025, 0.014);
         arrow.line.material.transparent = true;
         arrow.line.material.opacity = 0.65;
         arrow.line.material.depthTest = false;
@@ -145,12 +211,26 @@ export class RobotScene {
         this.content.add(arrow);
       }
     }
+    if (this.view === 'map') {
+      const origin = new THREE.Vector3(...pose.position);
+      const heading = new THREE.Vector3(pose.forward[0], pose.forward[1], 0);
+      const marker = new THREE.Mesh(new THREE.SphereGeometry(.025, 12, 8), new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false }));
+      marker.position.copy(origin); marker.renderOrder = 5; this.content.add(marker);
+      if (heading.lengthSq() > .0001) this.content.add(new THREE.ArrowHelper(heading.normalize(), origin, .18, 0xffffff, .04, .035));
+    }
     return { ready: true, clouds };
   }
 
   render() {
     if (!this.dirty) return;
     this.dirty = false;
+    const vp = this.viewport;
+    this.renderer.setScissorTest(false);
+    this.renderer.setViewport(0, 0, this.container.clientWidth, this.container.clientHeight);
+    this.renderer.clear();
+    this.renderer.setViewport(vp.x, vp.y, vp.width, vp.height);
+    this.renderer.setScissor(vp.x, vp.y, vp.width, vp.height);
+    this.renderer.setScissorTest(true);
     this.renderer.render(this.scene, this.camera);
     const width = this.container.clientWidth, height = this.container.clientHeight;
     const placed = [];
@@ -172,7 +252,7 @@ export class RobotScene {
         ? (cameraSpace.x < 0 ? '\u2190 ' : '\u2192 ')
         : (cameraSpace.y > 0 ? '\u2191 ' : '\u2193 ');
       item.title.textContent = `${offscreen ? bearing : ''}${item.name}`;
-      const preferredX = (px * .5 + .5) * width, preferredY = (-py * .5 + .5) * height;
+      const preferredX = vp.x + (px * .5 + .5) * vp.width, preferredY = vp.y + (-py * .5 + .5) * vp.height;
       const labelWidth = item.el.offsetWidth, labelHeight = item.el.offsetHeight;
       let spot;
       for (const dy of [0, -44, 44, -88, 88, -132, 132]) {
