@@ -9,10 +9,12 @@ test.beforeEach(async ({ page }) => {
 test('dashboard keeps controls and resource metrics within the responsive layout', async ({ page }) => {
   const resourceBox = await page.locator('#resources').boundingBox();
   const workspaceBox = await page.locator('#workspace').boundingBox();
-  if (page.viewportSize().width > 980) {
-    expect(resourceBox.x + resourceBox.width).toBeLessThanOrEqual(workspaceBox.x + 1);
+  const memoryBox = await page.locator('#memory-panel').boundingBox();
+  expect(resourceBox.y).toBeGreaterThanOrEqual(workspaceBox.y + workspaceBox.height);
+  if (page.viewportSize().width > 900) {
+    expect(memoryBox.x).toBeGreaterThanOrEqual(workspaceBox.x + workspaceBox.width - 1);
   } else {
-    expect(resourceBox.y).toBeGreaterThanOrEqual(workspaceBox.y + workspaceBox.height);
+    expect(memoryBox.y).toBeGreaterThanOrEqual(workspaceBox.y + workspaceBox.height);
   }
   for (const layout of ['spatial', 'camera', 'split']) {
     const button = page.locator(`button[data-layout=${layout}]`);
@@ -26,6 +28,14 @@ test('dashboard keeps controls and resource metrics within the responsive layout
   expect(await page.locator('dialog').evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
   await page.getByRole('button', { name: 'Close connection settings' }).click();
   await expect(page.locator('dialog')).not.toBeVisible();
+  await page.getByRole('button', { name: 'Hide object memory', exact: true }).click();
+  await expect(page.locator('#memory-panel')).toBeHidden();
+  await page.getByRole('button', { name: 'Show object memory', exact: true }).click();
+  await expect(page.locator('#memory-panel')).toBeVisible();
+  await page.getByRole('button', { name: 'Collapse compute metrics', exact: true }).click();
+  await expect(page.locator('.resource-metrics')).toBeHidden();
+  await page.getByRole('button', { name: 'Expand compute metrics', exact: true }).click();
+  await expect(page.locator('.resource-metrics')).toBeVisible();
 });
 
 test('buttons provide brief press feedback and honor reduced motion', async ({ page }) => {
@@ -39,6 +49,7 @@ test('buttons provide brief press feedback and honor reduced motion', async ({ p
   await expect.poll(() => button.evaluate(el => getComputedStyle(el).transform)).toBe('none');
   await page.emulateMedia({ reducedMotion: 'reduce' });
   expect(await button.evaluate(el => getComputedStyle(el).transitionDuration)).toBe('0s');
+  expect(await page.locator('.segmented').first().evaluate(el => getComputedStyle(el, '::before').transitionDuration)).toBe('0s');
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   await page.mouse.down();
   expect(await button.evaluate(el => getComputedStyle(el).transform)).toBe('none');

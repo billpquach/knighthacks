@@ -43,8 +43,29 @@ export function normalizeScene(raw) {
 export function distance(a, b) { return Math.hypot(...a.map((v, i) => v - b[i])); }
 
 export function displayName(object) {
-  const label = String(object.label || 'Object');
-  return object.color ? `${object.color[0].toUpperCase()}${object.color.slice(1)} ball` : `${label[0].toUpperCase()}${label.slice(1)} ${object.id}`;
+  const label = String(object.label || (object.color ? 'ball' : 'Object'));
+  return object.color ? `${object.color[0].toUpperCase()}${object.color.slice(1)} ${label}` : `${label[0].toUpperCase()}${label.slice(1)} ${object.id}`;
+}
+
+// Ages belong to the displayed telemetry frame, never the browser's wall clock.
+export function memoryAgeSeconds(object, frameTime) {
+  if (!object) return null;
+  if (object.state === 'VISIBLE') return 0;
+  if (Number.isFinite(object.since_seen_s) && object.since_seen_s >= 0) return object.since_seen_s;
+  if (Number.isFinite(frameTime) && Number.isFinite(object.last_seen_t) && object.last_seen_t >= 0 && object.last_seen_t <= frameTime) return frameTime - object.last_seen_t;
+  return null;
+}
+
+export function memoryAgeLabel(object, frameTime) {
+  const age = memoryAgeSeconds(object, frameTime);
+  if (age === null) return 'Last seen unknown';
+  if (object.state === 'VISIBLE') return 'Seen in frame';
+  if (age < 1) return 'Last seen <1s ago';
+  const seconds = Math.floor(age);
+  const duration = seconds < 60 ? `${seconds}s` : seconds < 3600
+    ? `${Math.floor(seconds / 60)}m ${seconds % 60}s`
+    : `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
+  return `Last seen ${duration} ago`;
 }
 
 // Point clouds are explicitly world-space or translation-only object-space.

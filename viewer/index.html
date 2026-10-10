@@ -3,34 +3,38 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#10151e" />
+    <meta name="theme-color" content="#0c0c0c" />
     <title>Permanence | Robot View</title>
   </head>
   <body>
     <div id="app">
       <header class="topbar">
-        <div class="brand"><i data-lucide="scan-eye"></i><div>PERMANENCE<span>ROBOT VIEW / 01</span></div></div>
-        <div class="connection"><span id="status-dot" class="status-dot"></span><span id="connection-status" role="status">CONNECTING</span><span id="fps" class="metric">-- fps</span></div>
-        <div class="top-actions"><span id="source-name">Local source</span><button id="source-button" class="icon-button" title="Stream connection" aria-label="Stream connection"><i data-lucide="radio"></i></button><button id="fullscreen" class="icon-button" title="Fullscreen" aria-label="Fullscreen"><i data-lucide="maximize"></i></button></div>
+        <div class="brand"><i data-lucide="scan-eye"></i><div>PERMANENCE<span>SPATIAL MEMORY</span></div></div>
+        <div class="connection"><span id="status-dot" class="status-dot"></span><span id="connection-status" role="status">CONNECTING</span><span id="source-name">Local source</span></div>
+        <div class="top-actions"><button id="source-button" class="text-button" title="Stream connection" aria-label="Stream connection"><i data-lucide="radio"></i><span>Connection</span></button><button id="fullscreen" class="icon-button" title="Fullscreen" aria-label="Fullscreen"><i data-lucide="maximize"></i></button></div>
       </header>
-      <div class="toolbar">
-        <div class="view-title">Spatial awareness <span id="phase">WAITING</span></div>
+      <section class="overview" aria-label="Observation overview">
+        <div><div class="eyebrow">WORKSPACE <span>/</span> <span id="phase">WAITING</span></div><h1>Observation</h1></div>
+        <div class="observation-counts"><div><strong id="observed-count">--</strong><span>Observed</span></div><div><strong id="unseen-count">--</strong><span>Unseen</span></div></div>
+        <button id="inspector-toggle" class="icon-button" title="Hide object memory" aria-label="Hide object memory" aria-expanded="true" aria-controls="memory-panel"><i data-lucide="panel-right-close"></i></button>
+      </section>
+      <div class="toolbar" aria-label="Observation controls">
         <div class="view-controls">
           <div class="segmented" role="group" aria-label="Spatial projection">
-            <button id="map-view" class="icon-button" title="Memory map" aria-label="Memory map" aria-pressed="false"><i data-lucide="radar"></i></button>
-            <button id="robot-view" class="icon-button active" title="Calibrated robot perspective" aria-label="Calibrated robot perspective" aria-pressed="true"><i data-lucide="navigation"></i></button>
+            <button id="robot-view" class="projection-button active" title="Calibrated robot perspective" aria-label="Calibrated robot perspective" aria-pressed="true"><i data-lucide="navigation"></i><span>Robot</span></button>
+            <button id="map-view" class="projection-button" title="Memory map" aria-label="Memory map" aria-pressed="false"><i data-lucide="radar"></i><span>Map</span></button>
           </div>
           <div class="segmented" role="group" aria-label="View layout">
             <button data-layout="split" class="icon-button active" title="Split view" aria-label="Split view" aria-pressed="true"><i data-lucide="columns-2"></i></button>
             <button data-layout="spatial" class="icon-button" title="Spatial view with camera inset" aria-label="Spatial view with camera inset" aria-pressed="false"><i data-lucide="picture-in-picture-2"></i></button>
             <button data-layout="camera" class="icon-button" title="Camera view with spatial inset" aria-label="Camera view with spatial inset" aria-pressed="false"><i data-lucide="camera"></i></button>
           </div>
-          <button id="pause" class="icon-button" title="Freeze display" aria-label="Freeze display" aria-pressed="false"><i data-lucide="pause"></i></button>
         </div>
+        <div class="playback-controls"><span id="fps" class="metric">-- fps</span><button id="pause" class="icon-button" title="Freeze display" aria-label="Freeze display" aria-pressed="false"><i data-lucide="pause"></i></button></div>
       </div>
       <section id="resources" aria-label="Jetson resource utilization">
-        <div class="resource-heading"><span>JETSON RESOURCES</span><span class="resource-status" role="status">NOT CONNECTED</span></div>
-        <div class="resource-metrics"></div>
+        <div class="resource-heading"><i data-lucide="cpu"></i><span>Jetson compute</span><span class="resource-status" role="status">NOT CONNECTED</span><button id="resources-toggle" class="icon-button" aria-label="Collapse compute metrics" title="Collapse compute metrics" aria-expanded="true" aria-controls="resource-metrics"><i data-lucide="chevron-down"></i></button></div>
+        <div id="resource-metrics" class="resource-metrics"></div>
       </section>
       <main id="workspace" data-layout="split">
         <section id="spatial-panel" aria-label="Robot perspective visualization">
@@ -47,11 +51,17 @@
         </section>
         <div id="stale-banner" role="status" hidden>Connection interrupted. Showing last received state.</div>
       </main>
-      <section class="memory-bar" aria-label="Object memory">
-        <div class="memory-title"><i data-lucide="layers-3"></i><span>OBJECT MEMORY</span><b id="object-count">0</b></div>
-        <div id="object-list" role="group" aria-label="Tracked objects"></div>
-        <div class="target-readout"><span id="target-label">No target</span><strong id="target-distance">--<small> m</small></strong><span id="target-state">Awaiting state</span></div>
-      </section>
+      <aside id="memory-panel" aria-label="Object memory">
+        <div class="memory-heading"><div class="eyebrow">PERSISTENT PERCEPTION</div><h2>Object memory <b id="object-count">0</b></h2></div>
+        <div class="memory-search"><i data-lucide="search"></i><input id="object-search" type="search" aria-label="Search objects" placeholder="Find an object" autocomplete="off" /><button id="clear-search" class="icon-button" aria-label="Clear object search" title="Clear search" hidden><i data-lucide="x"></i></button></div>
+        <div class="memory-filters" role="group" aria-label="Object visibility filter"><button class="active" data-filter="all" aria-pressed="true">All</button><button data-filter="observed" aria-pressed="false">Observed</button><button data-filter="unseen" aria-pressed="false">Unseen</button></div>
+        <div class="memory-results"><div id="object-list" role="group" aria-label="Tracked objects"></div><p id="memory-empty">Waiting for objects</p></div>
+        <div class="target-readout">
+          <div class="selection-heading"><span class="eyebrow">SELECTED OBJECT</span><button id="follow-target" class="icon-button" title="Follow automatic target" aria-label="Follow automatic target" aria-pressed="true"><i data-lucide="crosshair"></i></button></div>
+          <h3 id="target-label">No target</h3><span id="target-state">Awaiting state</span>
+          <div class="selection-measurements"><div><span class="measurement-label">Distance</span><strong id="target-distance">--<small> m</small></strong></div><div><span class="measurement-label">Last observation</span><span id="target-memory" title="Time since last observation at the displayed frame">Last seen unknown</span></div></div>
+        </div>
+      </aside>
       <footer><span><b id="mode-label">DISCONNECTED</b><span class="footer-separator">/</span><span id="stream-detail">State + camera</span></span><span id="last-update">No telemetry</span></footer>
     </div>
     <dialog id="connection-dialog">

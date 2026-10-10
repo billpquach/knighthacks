@@ -10,7 +10,7 @@ export class RobotScene {
     this.container = container;
     this.labels = labels;
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x101722);
+    this.scene.background = new THREE.Color(0x101010);
     this.camera = new THREE.PerspectiveCamera(66, 1, 0.01, 100);
     this.camera.up.set(0, 0, 1);
     this.perspective = this.camera;
@@ -77,11 +77,11 @@ export class RobotScene {
     if (data) {
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.Float32BufferAttribute(data.cloud.points.flat(), 3));
-      this.environment.add(new THREE.Points(geometry, new THREE.PointsMaterial({ color: 0x82998c,
+      this.environment.add(new THREE.Points(geometry, new THREE.PointsMaterial({ color: 0x929292,
         size: .008, transparent: true, opacity: .48, depthWrite: false })));
       const outline = data.table.outline.map(p => new THREE.Vector3(...p, data.table.z));
       if (outline.length >= 3) this.environment.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(outline),
-        new THREE.LineBasicMaterial({ color: 0x99b5a1, transparent: true, opacity: .4 })));
+        new THREE.LineBasicMaterial({ color: 0xaaaaaa, transparent: true, opacity: .4 })));
       if (outline.length) this.mapBounds = new THREE.Box3().setFromPoints(outline);
       else if (data.cloud.points.length) this.mapBounds = new THREE.Box3().setFromBufferAttribute(geometry.attributes.position);
     }

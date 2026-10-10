@@ -3,9 +3,24 @@
 A local Three.js viewer for the Jetson's `/state` SSE stream (or `/state.json`, the newest
 state once) and `/frame.jpg` x-ray camera feed. The default port is **8080**, defined in `replay_server.py`.
 The default spatial view is calibrated robot perspective; the radar control switches
-to the top-down memory map. The interface supports split view, spatial view with camera inset, and camera
+to the top-down memory map. New sessions start with a large spatial view and camera
+inset; saved layout preferences are retained. The interface supports split view, spatial view with camera inset, and camera
 view with spatial inset. Select an object to inspect its bearing and distance;
 selection is local to the viewer and never commands the rover.
+
+The object inspector provides case-insensitive name/ID search and All, Observed,
+and Unseen filters. Select a row to inspect its distance and memory age, or use
+the crosshair to follow the stream's automatic target. These controls also work
+on the frozen frame. The inspector can be hidden for a wider viewport; compute
+metrics can be collapsed independently. On narrow screens, the inspector and
+compute strip stack below the viewing controls.
+
+Object memory shows the last-observed age for every tracked object and the
+selected target. Ages use `since_seen_s`, or `t - last_seen_t` when available,
+at the displayed telemetry frame. They stay frozen with the display and do not
+advance on browser time during an outage. Visible objects show "Seen in frame";
+missing or invalid timestamps show "Last seen unknown". The black/gray theme with green accents
+keeps object-state colors distinct and honors reduced-motion preferences.
 
 ## Run locally
 
