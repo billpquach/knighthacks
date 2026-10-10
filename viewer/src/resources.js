@@ -1,10 +1,10 @@
 const fields = [
-  ['memory', 'Shared memory', 'ram_used_gb', 'GiB', '#73e6d3'],
-  ['gpu', 'GPU', 'gpu_pct', '%', '#bba6ef'],
-  ['cpu', 'CPU', 'cpu_pct', '%', '#8cbafa'],
+  ['memory', 'Shared memory', 'ram_used_gb', 'GiB', '#bcbcbc'],
+  ['gpu', 'GPU', 'gpu_pct', '%', '#76b900'],
+  ['cpu', 'CPU', 'cpu_pct', '%', '#dddddd'],
   ['temperature', 'Temperature', 'temp_c', 'C', '#f4d06c'],
   ['power', 'Board power', 'power_w', 'W', '#f2ad91'],
-  ['swap', 'Swap', 'swap_used_mb', 'MiB', '#9db6a9'],
+  ['swap', 'Swap', 'swap_used_mb', 'MiB', '#929292'],
 ];
 
 export function normalizeMetrics(raw) {
