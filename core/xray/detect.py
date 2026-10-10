@@ -95,7 +95,8 @@ class Detector:
         self.engine = self.weights.suffix == ".engine"
         self.model = YOLO(str(self.weights), task="segment") if self.engine else YOLOE(str(self.weights))
         self.device = device
-        self.ms = []                                        # inference time per call
+        self.ms = []                                        # time per call (everything: pre, model, post, masks)
+        self.speed = []                                     # ultralytics' own split per call: preprocess, inference, postprocess
 
     @property
     def names(self):
@@ -111,7 +112,7 @@ class Detector:
             boxes = r.boxes.xyxy.cpu().numpy()
             scores = r.boxes.conf.cpu().numpy()
             cls = r.boxes.cls.cpu().numpy().astype(int)
-            masks = r.masks.data.cpu().numpy() > 0.5 if r.masks is not None else None
+            masks = (r.masks.data > 0.5).cpu().numpy() if r.masks is not None else None    # threshold on the GPU
             h, w = rgb.shape[:2]
             for i in np.argsort(-scores):
                 m = masks[i] if masks is not None else np.zeros((h, w), bool)
@@ -120,6 +121,7 @@ class Detector:
                     m = cv2.resize(m.view(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
                 out.append(Detection(r.names[cls[i]], float(scores[i]), tuple(float(x) for x in boxes[i]), m))
         self.ms.append((time.perf_counter() - t) * 1000)
+        self.speed.append(dict(r.speed))
         return out
 
 
@@ -186,6 +188,7 @@ def bench(path, labels, n=30, weights=None, conf=0.2, imgsz=IMGSZ):
     for f in pick[:3]:
         det(load_rgb(f))                                    # warm-up (CUDA kernels, TensorRT contexts)
     det.ms.clear()
+    det.speed.clear()
     seen = {lab: [] for lab in det.labels}
     counts = []
     for f in pick:
@@ -198,6 +201,9 @@ def bench(path, labels, n=30, weights=None, conf=0.2, imgsz=IMGSZ):
     print(f"model: {det.weights.name} ({'TensorRT' if det.engine else 'PyTorch'}), image {imgsz[1]}x{imgsz[0]} (W x H), conf {conf}")
     print(f"frames: {len(pick)} of {len(files)} in {path}")
     print(f"time per frame: median {np.median(ms):.1f} ms, p95 {np.percentile(ms, 95):.1f} ms ({1000 / np.median(ms):.0f} fps)")
+    parts = {k: np.median([s.get(k, 0) for s in det.speed]) for k in ("preprocess", "inference", "postprocess")}
+    print("  of which (ultralytics): " + ", ".join(f"{k} {v:.1f} ms" for k, v in parts.items())
+          + f", the rest (masks to numpy, Python) {np.median(ms) - sum(parts.values()):.1f} ms")
     print(f"detections per frame: median {np.median(counts):.0f}, max {max(counts)}")
     for lab, s in seen.items():
         print(f"  {lab!r}: {len(s)} detections" + (f", score {min(s):.2f}-{max(s):.2f} (median {np.median(s):.2f})" if s else ""))
