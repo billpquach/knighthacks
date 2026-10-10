@@ -2,6 +2,7 @@
 served to the glasses, the rover and the viewer.
 
     python -m xray.live --scan-seconds 20 [--ball] [--port 8080]                  # scan the table, then track
+    python -m xray.live --scan-seconds 20 --ask [--ball]      # Qwen-3D loads during the scan; ask, then "go" to track
     python -m xray.live --scan <scan folder> [--ball | --results <ground3d output>]  # an earlier scan, same session
     python -m xray.live --scan <scan> --replay <track folder> [--ball] [--speed 1]   # a recording instead of the phone
 
@@ -12,8 +13,11 @@ Endpoints, CORS on all (the same as replay_server.py, so the viewer and every cl
     /scene          the scan: table, coloured cloud, and each object's twin (for the viewer's 3D view)
     /metrics        the Jetson's resource use (core/jetson)
     /viewer-info    {"mode": "live"}
+    POST /prompt    a question for Qwen-3D, or "go" (JSON {"text": ...} or plain text): the dashboard, a voice front end
     /               the viewer, once built (viewer/dist)
-Until tracking starts the messages are {"phase": "scan"} with no objects. Each message carries about 1500 points of
+Until tracking starts the messages are {"phase": "scan"} with no objects, then with --ask {"phase": "ask"}: each
+answer as an object (id q1, q2, ..., its query, score and cloud; the newest is the target) and a "qwen" block (status,
+ready, thinking, answers), then {"phase": "starting"} while YOLOE loads, then {"phase": "track"}. Each message carries about 1500 points of
 the current depth frame (scene.point_cloud, for the viewer's live 3D view; --live-cloud 0: none). Every message also
 goes to <out>/states.jsonl (without the cloud); with --video the x-ray view to <out>/xray.mp4; with --record the raw frames to
 <out>/track, which --replay (or python -m xray.track) plays back.
@@ -26,6 +30,11 @@ The scan and the tracking must share the phone's ARKit session (don't restart Re
 put in the scan's world with its meta.json world_from_arkit. --results picks the target from Qwen-3D's first answer
 (python -m ground3d.ground --out); --ball plays the shell game (the yellow ball's cup is the target).
 
+--ask, one continuous run: Qwen-3D starts loading in its own process (ground3d.ground --serve) before the scan, so
+it is ready about when the scan ends. Questions come from POST /prompt or the console (typed, one per line); each
+answer's cloud is drawn on the camera view as it comes. "go" stops Qwen-3D (all its memory is freed), then YOLOE
+loads and tracking starts, the last answer's object as the target (a ball: its cup once it is hidden).
+
 The x-ray view: every object's digital twin, moved to where the tracker has it, drawn by xray.render (the target
 brighter; a hidden object glowing through whatever covers it); a ball under a cup drawn as a disc of its colour
 through the cup; a tag on each object; status lines at the top, and the verdict when a ball is revealed.
@@ -34,8 +43,10 @@ import argparse
 import json
 import math
 import mimetypes
-import queue
 import os
+import queue
+import shlex
+import subprocess
 import sys
 import threading
 import time
@@ -67,6 +78,7 @@ class Server:
         self.cond = threading.Condition()
         self.state, self.jpg, self.seq, self.stamp = {"phase": "scan"}, None, 0, time.time()
         self.scene, self.metrics = None, metrics
+        self.prompts = queue.Queue()                    # questions and commands: POST /prompt, or typed in the console
         self.httpd = ThreadingHTTPServer((host, port), handler(self))
         self.httpd.daemon_threads = True
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -100,7 +112,7 @@ def handler(server):
 
         def do_OPTIONS(self):
             self.send_response(204)
-            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "*")
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -117,6 +129,23 @@ def handler(server):
                 self.wfile.write(data)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
+        def do_POST(self):
+            """POST /prompt {"text": "..."} (or the plain text): a question for Qwen-3D, or "go"."""
+            if urlsplit(self.path).path != "/prompt":
+                self.send_error(404, "Not found")
+                return
+            raw = self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 10000)).decode("utf-8", "replace")
+            try:
+                text = str(json.loads(raw).get("text", ""))
+            except (ValueError, AttributeError):
+                text = raw
+            text = text.strip()
+            if text:
+                server.prompts.put(text)
+            with server.cond:
+                phase = server.state.get("phase")
+            self.body(json.dumps({"ok": bool(text), "phase": phase}).encode(), "application/json")
 
         def do_GET(self):
             url = urlsplit(self.path)
@@ -192,7 +221,7 @@ def scene_json(scan, tracks, cut=(), table_z=None):
     for tr in list(tracks) + list(cut):                # cups (numeric ids) and balls ("yellow ball")
         pts = np.zeros((0, 3)) if tr.points is None else \
             tr.points[np.linspace(0, len(tr.points) - 1, min(len(tr.points), 2000)).astype(int)] - tr.origin
-        scene["objects"].append(dict(id=tr.id, label=tr.label, position=tk.r4(tr.position), points=np.round(pts, 4).tolist()))
+        scene["objects"].append(dict(id=tr.id, label=tr.label, position=tk.r4(tr.origin), points=np.round(pts, 4).tolist()))
     return json.dumps(scene, separators=(",", ":"), allow_nan=False).encode()
 
 
@@ -348,6 +377,155 @@ def frames_from(source, start=None, speed=1.0):
             yield source.read()
 
 
+# ---------------------------------------------------------------------------------------- Qwen-3D, before tracking
+def qwen_command(jobs, python=None):
+    """The Qwen-3D server (ground3d.ground --serve): loads at once, answers the questions put in jobs/, exits on stop."""
+    return [python or sys.executable, "-m", "ground3d.ground", "--serve", str(jobs), "--parent", str(os.getpid())]
+
+
+class Qwen:
+    """Qwen-3D in its own process, so that all its memory is freed when it exits (before YOLOE loads)."""
+
+    def __init__(self, folder, extra=(), python=None):
+        self.folder = Path(folder)
+        self.folder.mkdir(parents=True, exist_ok=True)
+        for name in ("job.json", "result.json", "ready", "stop"):
+            (self.folder / name).unlink(missing_ok=True)
+        self.log = open(self.folder / "qwen.log", "w")
+        self.proc = subprocess.Popen(qwen_command(self.folder, python) + list(extra), cwd=str(ROOT / "core"),
+                                     stdout=self.log, stderr=subprocess.STDOUT)
+        self.t0, self.n = time.time(), 0
+
+    def ready(self):
+        return (self.folder / "ready").exists()
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def ask(self, scan, text, timeout=300):
+        """One question about the scan -> the server's result (answers[0] is the answer; "error" if it failed)."""
+        self.n += 1
+        tmp = self.folder / "job.tmp"
+        tmp.write_text(json.dumps(dict(scan=str(scan), queries=[text], more=True)))
+        tmp.rename(self.folder / "job.json")
+        result, end = self.folder / "result.json", time.time() + timeout
+        while not result.exists():
+            if not self.alive():
+                return dict(error=f"Qwen-3D stopped (see {self.folder / 'qwen.log'})")
+            if time.time() > end:
+                return dict(error=f"no answer in {timeout} s")
+            time.sleep(0.1)
+        res = json.loads(result.read_text())
+        result.rename(self.folder / f"result_{self.n}.json")
+        return res
+
+    def stop(self, timeout=30):
+        """Tell the server to exit, and wait: its memory must be free before YOLOE loads."""
+        (self.folder / "stop").touch()
+        try:
+            self.proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+        self.log.close()
+
+
+def camera_block(T):
+    return dict(position=tk.r4(T[:3, 3]), forward=tk.r4(T[:3, 2]), T_world_cam=np.round(T[:3].reshape(-1), 5).tolist())
+
+
+def answer_points(folder, a):
+    """An answer's dense cloud (<slug>_refined.ply, written by the server), or None."""
+    from ground3d.show import read_ply, slug
+    ply = Path(folder) / f"{slug(a['query'])}_refined.ply"
+    return read_ply(ply) if ply.exists() else None
+
+
+def ask_phase(qwen, scan, server, frames, log=print):
+    """Questions for Qwen-3D until "go": from POST /prompt (the dashboard, voice) or typed in the console. Meanwhile
+    the camera view shows every answer's cloud (the newest one as the target), and the state stream lists the answers
+    as objects, each with its cloud. Returns the answers ([dict(query, score, band, seconds, point, points, ...)])."""
+    answers, asked, busy = [], queue.Queue(), [None]
+
+    def work():                                         # one question at a time, beside the camera view
+        while True:
+            text = asked.get()
+            if text is None:
+                return
+            while not qwen.ready() and qwen.alive():
+                time.sleep(0.2)
+            busy[0] = text
+            res = qwen.ask(scan, text)
+            a = (res.get("answers") or [{}])[0]
+            if res.get("error") or not a.get("center"):
+                log(f"Qwen-3D: '{text}': {res.get('error') or 'nothing found'}")
+            else:
+                point = (a.get("refined") or {}).get("center") or a["center"]
+                answers.append(dict(a, point=point, points=answer_points(qwen.folder, a), ram_gb=res.get("ram_gb")))
+                log(f"Qwen-3D: '{text}' -> score {a['score']:.2f} ({a['band']}) at {tk.r4(point)}, {a['seconds']:.1f} s")
+            busy[0] = None
+
+    if sys.stdin is not None and sys.stdin.isatty():    # typed questions (a "| tee" keeps the keyboard)
+        def typed():
+            for line in sys.stdin:
+                if line.strip():
+                    server.prompts.put(line.strip())
+        threading.Thread(target=typed, daemon=True).start()
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    log('ASK: type a question (or POST /prompt {"text": ...}); "go" starts tracking')
+    go, last = False, None
+    for f in frames:
+        while not go:
+            try:
+                text = server.prompts.get_nowait()
+            except queue.Empty:
+                break
+            if text.lower().strip(" .!") in ("go", "start", "track"):
+                go = True
+            else:
+                asked.put(text)
+        if go:
+            if last is not None:                        # the view says what happens next while YOLOE loads
+                img, msg = last
+                tag(img, "go: Qwen-3D exits, YOLOE tracking starts", (img.shape[1] // 2, img.shape[0] - 24), AMBER, 0.6)
+                server.publish(img, dict(msg, phase="starting", qwen=dict(msg["qwen"], status="done")))
+            break
+        img = cv2.cvtColor(f.rgb, cv2.COLOR_RGB2BGR)
+        objects = []
+        for i, a in enumerate(list(answers)):
+            newest = i == len(answers) - 1
+            info = {"label_xy": None}
+            pts = a["points"] if a["points"] is not None else np.zeros((0, 3))
+            if len(pts):
+                info = render.draw_cloud(img, pts, f.K, f.T, f.depth, centre=a["point"], target=newest, order_seed=200 + i)
+            if info["label_xy"]:
+                tag(img, f"'{a['query']}' {a['score']:.2f}", (info["label_xy"][0], info["label_xy"][1] - 8),
+                    AMBER if newest else TEXT)
+            few = pts[np.linspace(0, len(pts) - 1, min(len(pts), 800)).astype(int)] if len(pts) else pts
+            objects.append(dict(id=f"q{i + 1}", label="Qwen-3D answer", query=a["query"], target=newest, state="VISIBLE",
+                                position=tk.r4(a["point"]), size=a.get("size"), score=a["score"], band=a["band"],
+                                seconds=a["seconds"], point_cloud=dict(frame="world", points=np.round(few, 3).tolist())))
+        if not qwen.ready():
+            status = f"loading Qwen-3D ... {time.time() - qwen.t0:.0f} s" if qwen.alive() else "Qwen-3D failed (see qwen.log)"
+        elif busy[0]:
+            status = f"Qwen-3D thinking: '{busy[0]}'"
+        else:
+            status = 'Qwen-3D ready: ask a question, or say "go"'
+        tag(img, status, (img.shape[1] // 2, 22), AMBER, 0.5)
+        for i, a in enumerate(answers[-4:]):
+            tag(img, f"'{a['query']}': {a['score']:.2f} ({a['band']}), {a['seconds']:.1f} s", (img.shape[1] // 2, 46 + 20 * i))
+        msg = dict(t=round(float(f.t), 3), frame=int(f.index), phase="ask", target_id=None,
+                   camera=camera_block(f.T), objects=objects,
+                   qwen=dict(status=status, ready=qwen.ready(), thinking=busy[0],
+                             answers=[{k: a[k] for k in ("query", "score", "band", "seconds", "point")} for a in answers]))
+        server.publish(img, msg)
+        last = img, msg
+    asked.put(None)
+    worker.join(timeout=300)                            # a question still being answered finishes first
+    return answers
+
+
 def live_cloud(f, n=1500, max_depth=3.0):
     """About n of the frame's confident depth points (world, mm-rounded), for the viewer's live 3D view."""
     ok = (f.conf == 2) & (f.depth > 0) & (f.depth < max_depth)
@@ -397,6 +575,10 @@ def main(argv=None):
     ap.add_argument("--start", type=float, help="replay from this recording time (s)")
     ap.add_argument("--prompt", default=tk.rf.DEFAULT_PROMPT, help=f"detector labels (default \"{tk.rf.DEFAULT_PROMPT}\")")
     ap.add_argument("--ball", action="store_true", help="the shell game: balls under cups")
+    ap.add_argument("--ask", action="store_true", help="Qwen-3D: load it at the start, ask questions after the scan, "
+                    "'go' to track (the last answer is the target)")
+    ap.add_argument("--qwen-args", default="", help="extra arguments for the Qwen-3D server, e.g. \"--models ~/models/qwen3d\"")
+    ap.add_argument("--qwen-python", help="the Python (venv) with torch and transformers for Qwen-3D (default: this one)")
     ap.add_argument("--results", help="target = Qwen-3D's first answer (a python -m ground3d.ground --out folder)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
@@ -421,14 +603,42 @@ def main(argv=None):
     if args.replay and not args.scan:
         ap.error("--replay needs the --scan of the same recording")
     labels = detect.parse_prompt(args.prompt)
-    cached = detect.load_detections(detect.cache_path(args.replay, labels)) if args.replay else None
-    scan_cached = args.scan and detect.load_detections(detect.cache_path(args.scan, labels)) is not None
-    detector = None if cached is not None and scan_cached else detect.Detector(labels)
+    qwen = Qwen(out / "qwen", shlex.split(args.qwen_args), args.qwen_python and str(Path(args.qwen_python).expanduser())) \
+        if args.ask else None                           # loads while the scan runs
+    if qwen is not None:
+        print(f"Qwen-3D loading in its own process (log: {qwen.folder / 'qwen.log'})", flush=True)
     phone = None
     if not args.replay:
         from .phone import Phone
         phone = Phone()
     scan = Path(args.scan) if args.scan else scan_with_phone(phone, args.scan_seconds, out, server)
+    source = fr.FolderSource(args.replay) if args.replay else phone
+    to_world = None if args.replay else world_from_phone(scan)
+
+    def in_world(frames):
+        for f in frames:
+            if to_world is not None:
+                f.T = to_world @ f.T
+            yield f
+    answers = []
+    if qwen is not None:                                # understand, then free the memory for YOLOE
+        try:
+            answers = ask_phase(qwen, scan, server, in_world(frames_from(source, args.start, args.speed)))
+        except KeyboardInterrupt:
+            answers = None
+        finally:
+            qwen.stop()
+        if answers is None:                             # Ctrl+C before "go"
+            server.close()
+            if metrics is not None:
+                metrics.stop()
+            if phone is not None:
+                os._exit(0)
+            return 0
+        print(f"Qwen-3D done: {len(answers)} answers; its memory is free; loading YOLOE", flush=True)
+    cached = detect.load_detections(detect.cache_path(args.replay, labels)) if args.replay else None
+    scan_cached = detect.load_detections(detect.cache_path(scan, labels)) is not None
+    detector = None if cached is not None and scan_cached else detect.Detector(labels)
     if detector is not None:
         detect_keyframes(scan, detector, labels)
     objects, table = tk.scan_objects(scan, args.prompt, use_detector=False)
@@ -441,17 +651,26 @@ def main(argv=None):
         game = shell.ShellGame(tracker, balls, table, scan)
     else:
         tracker = tk.Tracker(objects, table)
-        if args.results:
-            point, query = qwen_target(args.results)
-            tr = None if point is None else tk.nearest(tracker.tracks, point)
+    point, query = (answers[-1]["point"], answers[-1]["query"]) if answers else \
+        qwen_target(args.results) if args.results else (None, None)
+    if point is not None:                               # the object the answer picked, tracked from now on
+        tr = tk.nearest(tracker.tracks, point)
+        ball = min(game.balls, key=lambda b: tk.distance(b.track.position, point)) if game is not None and game.balls else None
+        if ball is not None and (tr is None or tk.distance(ball.track.position, point) < tk.distance(tr.position, point)):
+            game.target, picked = ball, ball.id             # a ball: its cup is the target once it is hidden
+        else:
             tracker.target_id = None if tr is None else tr.id
-            print(f"target: '{query}' -> {'none' if tr is None else f'{tr.label} {tr.id}'}", flush=True)
-    try:
-        server.scene = scene_json(scan, tracker.tracks, cut=[b.track for b in game.balls] if game else (), table_z=table)
-    except Exception as e:
-        print(f"(no /scene: {e})")
-    source = fr.FolderSource(args.replay) if args.replay else phone
-    to_world = None if args.replay else world_from_phone(scan)
+            if game is not None:
+                game.chosen = tracker.target_id
+            picked = "none" if tr is None else f"{tr.label} {tr.id}"
+        print(f"target: '{query}' -> {picked}", flush=True)
+    def make_scene():                                   # beside the tracking: it takes seconds, and /scene can wait
+        try:
+            server.scene = scene_json(scan, list(tracker.tracks), cut=[b.track for b in game.balls] if game else (),
+                                      table_z=table)
+        except Exception as e:
+            print(f"(no /scene: {e})", flush=True)
+    threading.Thread(target=make_scene, daemon=True).start()
     floor = 0.0                                         # the scan's world has the floor at z = 0
     frames_q, out_q, stop = queue.Queue(maxsize=2), queue.Queue(maxsize=1), threading.Event()
 
