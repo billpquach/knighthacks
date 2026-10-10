@@ -327,18 +327,27 @@ def draw_view(img, frame, tracker, game=None, fps=None, verdict=None):
 
 
 # ---------------------------------------------------------------------------------------- running
-def scan_with_phone(phone, seconds, out, server, log=print):
-    """xray.scan's capture, in this process (the phone stays connected for tracking)."""
+def scan_with_phone(phone, seconds, out, server, min_keyframes=20, log=print):
+    """xray.scan's capture, in this process (the phone stays connected for tracking). It goes on past `seconds`
+    (up to twice as long) until it has `min_keyframes` views: the objects' twins need them from all sides."""
     from . import scan as sc
-    shown = [0.0]
+    shown, more = [0.0], [False]
 
     def progress(f, n, left):
         if time.monotonic() - shown[0] > 0.2:
             shown[0] = time.monotonic()
             img = cv2.cvtColor(f.rgb, cv2.COLOR_RGB2BGR)
-            tag(img, f"SCANNING: walk slowly around the table  {max(0.0, left):4.1f} s, {n} keyframes", (img.shape[1] // 2, 24))
-            server.publish(img, {"phase": "scan"})
-    keyframes, n_read, blurry = sc.capture(phone, seconds, sc.KeyframePicker(), progress)
+            text = f"SCANNING: keep circling the cups, {n}/{min_keyframes} views" if more[0] else \
+                f"SCANNING: circle the cups slowly  {max(0.0, left):4.1f} s, {n}/{min_keyframes} views"
+            tag(img, text, (img.shape[1] // 2, 24))
+            server.publish(img, {"phase": "scan", "scan": {"views": n, "views_wanted": min_keyframes}})
+    picker = sc.KeyframePicker()
+    keyframes, n_read, blurry = sc.capture(phone, seconds, picker, progress)
+    extra = 0.0
+    while len(keyframes) < min_keyframes and extra < seconds:      # too few views yet: keep going
+        more[0] = True
+        keyframes, n, blurry = sc.capture(phone, 1.0, picker, progress)
+        n_read, extra = n_read + n, extra + 1.0
     if len(keyframes) < 8:
         raise SystemExit(f"only {len(keyframes)} keyframes: move around more (10 cm or 15 deg between keyframes)")
     shift, world = sc.fit_world(keyframes)
@@ -593,6 +602,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="The live x-ray (see the top of this file)")
     ap.add_argument("--scan", help="a scan folder of this phone session (else --scan-seconds scans first)")
     ap.add_argument("--scan-seconds", type=float, default=20, help="scan for this long first (without --scan)")
+    ap.add_argument("--min-keyframes", type=int, default=20,
+                    help="the scan goes on (up to twice --scan-seconds) until it has this many views")
     ap.add_argument("--replay", help="a recorded track folder instead of the phone (same world as --scan)")
     ap.add_argument("--speed", type=float, default=1.0, help="replay speed (0: as fast as possible)")
     ap.add_argument("--start", type=float, help="replay from this recording time (s)")
@@ -637,7 +648,7 @@ def main(argv=None):
     if not args.replay:
         from .phone import Phone
         phone = Phone()
-    scan = Path(args.scan) if args.scan else scan_with_phone(phone, args.scan_seconds, out, server)
+    scan = Path(args.scan) if args.scan else scan_with_phone(phone, args.scan_seconds, out, server, args.min_keyframes)
     source = fr.FolderSource(args.replay) if args.replay else phone
     to_world = None if args.replay else world_from_phone(scan)
 
