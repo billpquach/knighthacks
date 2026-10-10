@@ -1,0 +1,20 @@
+{
+  "note": "Scans, queries and expected answers for bench.py. Point 'scan' at scan folders on this Jetson. The first query of a case is the INIT target (its time counts toward INIT). Each case is one runner process (model load ~95 s), so put all the wordings for one scan in one case. expect, per query (all optional): score (the same confidence band: high >= 0.5, low >= 0.3), band, min_score, center [x, y, z] in metres (within tol_cm, default 3).",
+  "cases": [
+    {
+      "name": "thursday-live",
+      "scan": "~/permanence/runs/live_183221/scan",
+      "queries": [
+        "the cup next to the can",
+        "the cup next to the ball",
+        "the cup beside the can",
+        "the cup closest to the can",
+        "the clear cup next to the can"
+      ],
+      "expect": {
+        "the cup next to the can": {"score": 0.461, "center": [1.268, -0.442, 0.862]},
+        "the cup next to the ball": {"score": 0.548}
+      }
+    }
+  ]
+}
