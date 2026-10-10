@@ -378,21 +378,21 @@ def frames_from(source, start=None, speed=1.0):
 
 
 # ---------------------------------------------------------------------------------------- Qwen-3D, before tracking
-def qwen_command(jobs):
+def qwen_command(jobs, python=None):
     """The Qwen-3D server (ground3d.ground --serve): loads at once, answers the questions put in jobs/, exits on stop."""
-    return [sys.executable, "-m", "ground3d.ground", "--serve", str(jobs), "--parent", str(os.getpid())]
+    return [python or sys.executable, "-m", "ground3d.ground", "--serve", str(jobs), "--parent", str(os.getpid())]
 
 
 class Qwen:
     """Qwen-3D in its own process, so that all its memory is freed when it exits (before YOLOE loads)."""
 
-    def __init__(self, folder, extra=()):
+    def __init__(self, folder, extra=(), python=None):
         self.folder = Path(folder)
         self.folder.mkdir(parents=True, exist_ok=True)
         for name in ("job.json", "result.json", "ready", "stop"):
             (self.folder / name).unlink(missing_ok=True)
         self.log = open(self.folder / "qwen.log", "w")
-        self.proc = subprocess.Popen(qwen_command(self.folder) + list(extra), cwd=str(ROOT / "core"),
+        self.proc = subprocess.Popen(qwen_command(self.folder, python) + list(extra), cwd=str(ROOT / "core"),
                                      stdout=self.log, stderr=subprocess.STDOUT)
         self.t0, self.n = time.time(), 0
 
@@ -578,6 +578,7 @@ def main(argv=None):
     ap.add_argument("--ask", action="store_true", help="Qwen-3D: load it at the start, ask questions after the scan, "
                     "'go' to track (the last answer is the target)")
     ap.add_argument("--qwen-args", default="", help="extra arguments for the Qwen-3D server, e.g. \"--models ~/models/qwen3d\"")
+    ap.add_argument("--qwen-python", help="the Python (venv) with torch and transformers for Qwen-3D (default: this one)")
     ap.add_argument("--results", help="target = Qwen-3D's first answer (a python -m ground3d.ground --out folder)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
@@ -602,7 +603,8 @@ def main(argv=None):
     if args.replay and not args.scan:
         ap.error("--replay needs the --scan of the same recording")
     labels = detect.parse_prompt(args.prompt)
-    qwen = Qwen(out / "qwen", shlex.split(args.qwen_args)) if args.ask else None    # loads while the scan runs
+    qwen = Qwen(out / "qwen", shlex.split(args.qwen_args), args.qwen_python and str(Path(args.qwen_python).expanduser())) \
+        if args.ask else None                           # loads while the scan runs
     if qwen is not None:
         print(f"Qwen-3D loading in its own process (log: {qwen.folder / 'qwen.log'})", flush=True)
     phone = None
