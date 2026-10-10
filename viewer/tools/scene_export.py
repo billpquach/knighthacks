@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "core"))
 from xray.frames import backproject, frame_ids, read_frame
 
 
-def export_scene(folder, objects=()):
+def export_scene(folder, objects=(), table_z=None):
     cells = {}
     calibration = None
     ids = frame_ids(folder)
@@ -35,11 +35,14 @@ def export_scene(folder, objects=()):
         raise ValueError("Scan has no high-confidence points within 3 metres")
     points = np.array([v[0] for v in cells.values()])
     colors = np.array([v[1] for v in cells.values()])
-    heights, edges = np.histogram(points[:, 2], bins=40, range=(.4, 1.2))
-    if not heights.any():
-        raise ValueError("No tabletop candidates between 0.4 and 1.2 metres")
-    peak = int(heights.argmax())
-    z = float((edges[peak] + edges[peak + 1]) / 2)
+    if table_z is not None:                 # the support surface found by the caller (a table, or the floor)
+        z = float(table_z)
+    else:
+        heights, edges = np.histogram(points[:, 2], bins=40, range=(.4, 1.2))
+        if not heights.any():
+            raise ValueError("No tabletop candidates between 0.4 and 1.2 metres")
+        peak = int(heights.argmax())
+        z = float((edges[peak] + edges[peak + 1]) / 2)
     surface = points[np.abs(points[:, 2] - z) <= .02, :2].astype(np.float32)
     outline = cv2.convexHull(surface).reshape(-1, 2).round(5).tolist() if len(surface) >= 3 else []
     # Deterministic even sampling preserves coverage after voxel thinning.

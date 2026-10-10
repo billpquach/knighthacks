@@ -18,8 +18,9 @@ the current depth frame (scene.point_cloud, for the viewer's live 3D view; --liv
 goes to <out>/states.jsonl (without the cloud); with --video the x-ray view to <out>/xray.mp4; with --record the raw frames to
 <out>/track, which --replay (or python -m xray.track) plays back.
 
-Three threads, so the frame rate is set by the slowest stage, not by all of them together: frames and detections;
-tracking, the game and the x-ray view; JPEG, serving, the log and the files.
+Separate threads, so the frame rate is set by the slowest stage, not by all of them together: frames and detections;
+tracking, the game and the x-ray view; JPEG and serving (always the newest frame, so the feed never lags); the log,
+video and recording (live, a frame they can't keep up with is skipped there, never in the feed).
 
 The scan and the tracking must share the phone's ARKit session (don't restart Record3D in between): live frames are
 put in the scan's world with its meta.json world_from_arkit. --results picks the target from Qwen-3D's first answer
@@ -70,7 +71,7 @@ class Server:
         self.httpd.daemon_threads = True
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
-    def publish(self, img=None, state=None, quality=80):
+    def publish(self, img=None, state=None, quality=75):
         jpg = None
         if img is not None:
             ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
@@ -173,13 +174,13 @@ def handler(server):
     return Handler
 
 
-def scene_json(scan, tracks, cut=()):
+def scene_json(scan, tracks, cut=(), table_z=None):
     """The /scene document: the scan (viewer/tools/scene_export.py) with each object's twin as offsets from it. The
     scan's own copies of the objects (tracks and `cut`, where they stood when scanned) are taken out of the
     environment cloud: objects move, and a copy left behind would be a ghost."""
     sys.path.insert(0, str(ROOT / "viewer" / "tools"))
     from scene_export import export_scene
-    scene = export_scene(scan)
+    scene = export_scene(scan, table_z=table_z)
     env, colours = np.asarray(scene["cloud"]["points"], float).reshape(-1, 3), scene["cloud"]["colors"]
     keep = np.ones(len(env), bool)
     for tr in list(tracks) + list(cut):
@@ -188,7 +189,7 @@ def scene_json(scan, tracks, cut=()):
         keep &= ~(reach & (env[:, 2] < top))
     scene["cloud"] = dict(points=np.round(env[keep], 5).tolist(), colors=[c for c, k in zip(colours, keep) if k])
     scene["objects"] = []
-    for tr in tracks:
+    for tr in list(tracks) + list(cut):                # cups (numeric ids) and balls ("yellow ball")
         pts = np.zeros((0, 3)) if tr.points is None else \
             tr.points[np.linspace(0, len(tr.points) - 1, min(len(tr.points), 2000)).astype(int)] - tr.origin
         scene["objects"].append(dict(id=tr.id, label=tr.label, position=tk.r4(tr.position), points=np.round(pts, 4).tolist()))
@@ -364,7 +365,18 @@ class Recorder:
         self.folder, self.n, self.times, self.size = Path(folder), 0, [], None
 
     def add(self, f):
-        fr.write_frame(self.folder, self.n, f)
+        """xray.frames.write_frame's layout, written faster (light PNG compression): it runs beside a live loop."""
+        k = self.n
+        if k == 0:
+            for d in ("color", "depth", "conf", "intrinsic", "pose"):
+                (self.folder / d).mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(self.folder / "color" / f"{k}.jpg"), cv2.cvtColor(f.rgb, cv2.COLOR_RGB2BGR),
+                    [cv2.IMWRITE_JPEG_QUALITY, 92])
+        png = [cv2.IMWRITE_PNG_COMPRESSION, 1]
+        cv2.imwrite(str(self.folder / "depth" / f"{k}.png"), np.clip(np.round(f.depth * 1000), 0, 65535).astype(np.uint16), png)
+        cv2.imwrite(str(self.folder / "conf" / f"{k}.png"), f.conf.astype(np.uint8), png)
+        np.savetxt(self.folder / "intrinsic" / f"{k}.txt", f.K, fmt="%.6f")
+        np.savetxt(self.folder / "pose" / f"{k}.txt", f.T, fmt="%.8f")
         self.times.append(round(float(f.t), 4))
         self.size = list(f.size)
         self.n += 1
@@ -435,13 +447,13 @@ def main(argv=None):
             tracker.target_id = None if tr is None else tr.id
             print(f"target: '{query}' -> {'none' if tr is None else f'{tr.label} {tr.id}'}", flush=True)
     try:
-        server.scene = scene_json(scan, tracker.tracks, cut=[b.track for b in game.balls] if game else ())
+        server.scene = scene_json(scan, tracker.tracks, cut=[b.track for b in game.balls] if game else (), table_z=table)
     except Exception as e:
         print(f"(no /scene: {e})")
     source = fr.FolderSource(args.replay) if args.replay else phone
     to_world = None if args.replay else world_from_phone(scan)
     floor = 0.0                                         # the scan's world has the floor at z = 0
-    frames_q, out_q, stop = queue.Queue(maxsize=2), queue.Queue(maxsize=4), threading.Event()
+    frames_q, out_q, stop = queue.Queue(maxsize=2), queue.Queue(maxsize=1), threading.Event()
 
     def offer(q, item, newest=False):
         """Put item on q; with newest, drop an item not yet taken instead of waiting (live: never fall behind)."""
@@ -471,16 +483,23 @@ def main(argv=None):
         offer(frames_q, None)
 
     record = Recorder(out / "track") if args.record else None
+    files_q, dropped = queue.Queue(maxsize=64), [0]
 
-    def output():                                       # thread 3: JPEG, the stream, the log, the video, the recording
+    def publish():                                      # thread 3: JPEG and the stream, always the newest frame
+        while True:
+            item = out_q.get()
+            if item is None:
+                break
+            server.publish(*item)
+
+    def write():                                        # thread 4: the log, the video, the recording (may lag)
         video = None
         with open(out / "states.jsonl", "w") as log:
             while True:
-                item = out_q.get()
+                item = files_q.get()
                 if item is None:
                     break
                 img, msg, f = item
-                server.publish(img, msg)
                 log.write(json.dumps({k: v for k, v in msg.items() if k != "scene"}, separators=(",", ":")) + "\n")
                 if args.video:
                     if video is None:
@@ -492,7 +511,8 @@ def main(argv=None):
         if video is not None:
             video.release()
 
-    threads = [threading.Thread(target=produce, daemon=True), threading.Thread(target=output, daemon=True)]
+    threads = [threading.Thread(target=produce, daemon=True), threading.Thread(target=publish, daemon=True),
+               threading.Thread(target=write, daemon=True)]
     for th in threads:
         th.start()
     verdict, verdict_t, seen_verdicts = None, 0.0, set()
@@ -527,28 +547,42 @@ def main(argv=None):
                 msg["scene"] = dict(floor_z=floor, point_cloud=dict(frame="world", points=live_cloud(f, args.live_cloud)))
             img = draw_view(cv2.cvtColor(f.rgb, cv2.COLOR_RGB2BGR), f, tracker, game, fps,
                             verdict if verdict and f.t - verdict_t < 5 else None)
-            offer(out_q, (img, msg, f))
+            offer(out_q, (img, msg), newest=True)        # the stream never waits behind the files
+            if phone is None:
+                files_q.put((img, msg, f))              # a replay keeps every frame
+            else:
+                try:
+                    files_q.put_nowait((img, msg, f))
+                except queue.Full:                      # the files fell behind: skip this frame there
+                    dropped[0] += 1
     except KeyboardInterrupt:
         pass
-    finally:
-        try:
-            out_q.put(None, timeout=5)
-        except queue.Full:
-            pass
-        threads[1].join(timeout=30)                     # let the log, video and recording finish
+    finally:                                            # every step guarded: the files must close, the process exit
+        for q, th in ((out_q, threads[1]), (files_q, threads[2])):
+            try:
+                q.put(None, timeout=5)
+            except queue.Full:
+                pass
+            th.join(timeout=60)                         # the log, video and recording finish
         stop.set()
-        if record is not None:
-            record.close()
-        if game is not None and game.events:
-            print("events:\n" + "\n".join(f"  {t:6.2f} s  {e}" for t, e in game.events))
-        print(f"-> {out}/states.jsonl" + (" and xray.mp4" if args.video else "")
-              + (f", {record.n} frames in track/" if record is not None else ""), flush=True)
-        server.close()
-        if metrics is not None:
-            metrics.stop()
-        if phone is not None:
-            sys.stdout.flush()
-            os._exit(0)             # record3d's teardown at a normal exit crashes (as in xray.scan); all is written
+        try:
+            if record is not None:
+                record.close()
+            if game is not None and game.events:
+                print("events:\n" + "\n".join(f"  {t:6.2f} s  {e}" for t, e in game.events))
+            print(f"-> {out}/states.jsonl" + (" and xray.mp4" if args.video else "")
+                  + (f", {record.n} frames in track/" if record is not None else "")
+                  + (f" ({dropped[0]} frames not saved: the files fell behind)" if dropped[0] else ""), flush=True)
+        except (BrokenPipeError, OSError):              # the console went away (Ctrl+C also stops a | tee)
+            pass
+        finally:
+            try:
+                server.close()
+                if metrics is not None:
+                    metrics.stop()
+            finally:
+                if phone is not None:
+                    os._exit(0)     # record3d's teardown at a normal exit hangs or crashes (as in xray.scan)
     return 0
 
 
