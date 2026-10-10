@@ -2,11 +2,14 @@ import { createIcons, ScanEye, Radio, Radar, Maximize, Columns2, PictureInPictur
 import { RobotScene } from './scene.js';
 import { normalizeState, normalizeScene, resolveTarget, displayName, distance, sourceUrl, cameraPose } from './state.js';
 import './style.css';
+import { ResourcePanel, metricsUrl } from './resources.js';
 
 const $ = id => document.getElementById(id);
 const icons = { ScanEye, Radio, Radar, Maximize, Columns2, PictureInPicture2, Camera, Pause, Play, Navigation, Scan, VideoOff, Layers3, X, Plug };
 const drawIcons = () => createIcons({ icons });
 drawIcons();
+const resources = new ResourcePanel($('resources'));
+let resourceUrl = stored('robot-metrics-url', '');
 
 let scene;
 try { scene = new RobotScene($('scene'), $('labels')); }
@@ -171,6 +174,8 @@ async function connect(url) {
   const token = ++generation;
   ++sceneRequest; fileScene = false; $('scene-file').value = '';
   source = sourceUrl(url);
+  try { resources.connect(metricsUrl(resourceUrl, source)); }
+  catch { resourceUrl = ''; resources.connect(`${source}/metrics`); }
   events?.close(); clearTimeout(frameTimer); frameController?.abort();
   lastStateAt = 0; lastImageAt = 0; lastSeq = null; receivedValidState = false; selectedId = null;
   state = null; pendingState = null; listKey = ''; mode = 'unknown';
@@ -232,6 +237,7 @@ $('fullscreen').onclick = async () => {
 };
 $('source-button').onclick = () => {
   $('stream-url').value = source; $('frame-path').value = framePath; $('connection-error').textContent = '';
+  $('metrics-url').value = resourceUrl;
   $('connection-dialog').showModal();
 };
 $('close-dialog').onclick = () => $('connection-dialog').close();
@@ -240,9 +246,13 @@ $('connection-form').onsubmit = event => {
   event.preventDefault();
   try {
     const value = sourceUrl($('stream-url').value);
+    const resourceValue = $('metrics-url').value.trim();
+    const resourceEndpoint = metricsUrl(resourceValue, value);
+    if (location.protocol === 'https:' && resourceEndpoint.startsWith('http:')) throw new Error('Open the viewer over HTTP for HTTP Jetson metrics.');
     const path = $('frame-path').value.trim();
     if (!/^\/(?!\/)[^?#\s]*$/.test(path)) throw new Error('Use an endpoint path such as /frame.jpg.');
     if (location.protocol === 'https:' && value.startsWith('http:')) throw new Error('Open this viewer over HTTP to connect to an HTTP robot.');
+    resourceUrl = resourceValue; persist('robot-metrics-url', resourceUrl);
     framePath = path; paused = false;
     $('pause').setAttribute('aria-pressed', 'false'); $('pause').setAttribute('aria-label', 'Freeze display');
     $('pause').title = 'Freeze display'; $('pause').innerHTML = '<i data-lucide="pause"></i>'; drawIcons();

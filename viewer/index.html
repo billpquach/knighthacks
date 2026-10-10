@@ -28,6 +28,10 @@
           <button id="pause" class="icon-button" title="Freeze display" aria-label="Freeze display" aria-pressed="false"><i data-lucide="pause"></i></button>
         </div>
       </div>
+      <section id="resources" aria-label="Jetson resource utilization">
+        <div class="resource-heading"><span>JETSON RESOURCES</span><span class="resource-status" role="status">NOT CONNECTED</span></div>
+        <div class="resource-metrics"></div>
+      </section>
       <main id="workspace" data-layout="split">
         <section id="spatial-panel" aria-label="Robot perspective visualization">
           <div id="scene"></div><div id="labels"></div>
@@ -55,6 +59,7 @@
         <div class="dialog-heading"><h2>Stream connection</h2><button type="button" id="close-dialog" class="icon-button" aria-label="Close connection settings" title="Close"><i data-lucide="x"></i></button></div>
         <label for="stream-url">Robot URL</label><input id="stream-url" type="url" placeholder="http://192.168.55.1:8080" required />
         <label for="frame-path">Front camera endpoint</label><input id="frame-path" value="/frame.jpg" required />
+        <label for="metrics-url">Jetson metrics URL</label><input id="metrics-url" type="url" placeholder="Same robot /metrics" />
         <label for="scene-file">Scene preview file</label><input id="scene-file" type="file" accept=".json,application/json" />
         <p id="scene-status" role="status">No static scene</p>
         <p id="connection-error" role="alert"></p>
