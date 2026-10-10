@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101415" />
+    <title>Permanence | Robot View</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand"><i data-lucide="scan-eye"></i><div>PERMANENCE<span>ROBOT VIEW / 01</span></div></div>
+        <div class="connection"><span id="status-dot" class="status-dot"></span><span id="connection-status" role="status">CONNECTING</span><span id="fps" class="metric">-- fps</span></div>
+        <div class="top-actions"><span id="source-name">Local source</span><button id="source-button" class="icon-button" title="Stream connection" aria-label="Stream connection"><i data-lucide="radio"></i></button><button id="fullscreen" class="icon-button" title="Fullscreen" aria-label="Fullscreen"><i data-lucide="maximize"></i></button></div>
+      </header>
+      <div class="toolbar">
+        <div class="view-title">Spatial awareness <span id="phase">WAITING</span></div>
+        <div class="view-controls">
+          <div class="segmented" role="group" aria-label="View layout">
+            <button data-layout="split" class="icon-button active" title="Split view" aria-label="Split view" aria-pressed="true"><i data-lucide="columns-2"></i></button>
+            <button data-layout="spatial" class="icon-button" title="Spatial view with camera inset" aria-label="Spatial view with camera inset" aria-pressed="false"><i data-lucide="picture-in-picture-2"></i></button>
+            <button data-layout="camera" class="icon-button" title="Camera view with spatial inset" aria-label="Camera view with spatial inset" aria-pressed="false"><i data-lucide="camera"></i></button>
+          </div>
+          <button id="pause" class="icon-button" title="Freeze display" aria-label="Freeze display" aria-pressed="false"><i data-lucide="pause"></i></button>
+        </div>
+      </div>
+      <main id="workspace" data-layout="split">
+        <section id="spatial-panel" aria-label="Robot perspective visualization">
+          <div id="scene"></div><div id="labels"></div>
+          <div class="panel-heading"><i data-lucide="navigation"></i><span>ROBOT PERSPECTIVE</span><span id="geometry-type" class="panel-tag">WAITING</span></div>
+          <div id="scene-empty" class="empty-state"><i data-lucide="scan"></i><span>Waiting for robot state</span></div>
+          <div class="scene-bottom"><div class="legend"><span><b class="cyan"></b>Observed</span><span><b class="yellow"></b>Remembered</span><span><b class="gray"></b>Environment</span></div><span class="units">METERS / Z UP</span></div>
+        </section>
+        <section id="camera-panel" aria-label="Front camera feed">
+          <img id="camera-frame" alt="Robot front camera with x-ray overlay" />
+          <div class="panel-heading"><i data-lucide="camera"></i><span>FRONT CAMERA</span><span id="camera-type" class="panel-tag">X-RAY</span></div>
+          <div id="camera-empty" class="empty-state"><i data-lucide="video-off"></i><span>Waiting for camera</span></div>
+          <div class="camera-bottom"><span id="frame-seq">FRAME --</span><span id="frame-age">-- ms</span></div>
+        </section>
+        <div id="stale-banner" role="status" hidden>Connection interrupted. Showing last received state.</div>
+      </main>
+      <section class="memory-bar" aria-label="Object memory">
+        <div class="memory-title"><i data-lucide="layers-3"></i><span>OBJECT MEMORY</span><b id="object-count">0</b></div>
+        <div id="object-list" role="group" aria-label="Tracked objects"></div>
+        <div class="target-readout"><span id="target-label">No target</span><strong id="target-distance">--<small> m</small></strong><span id="target-state">Awaiting state</span></div>
+      </section>
+      <footer><span><b id="mode-label">DISCONNECTED</b><span class="footer-separator">/</span><span id="stream-detail">State + camera</span></span><span id="last-update">No telemetry</span></footer>
+    </div>
+    <dialog id="connection-dialog">
+      <form id="connection-form">
+        <div class="dialog-heading"><h2>Stream connection</h2><button type="button" id="close-dialog" class="icon-button" aria-label="Close connection settings" title="Close"><i data-lucide="x"></i></button></div>
+        <label for="stream-url">Robot URL</label><input id="stream-url" type="url" placeholder="http://192.168.55.1:8080" required />
+        <label for="frame-path">Front camera endpoint</label><input id="frame-path" value="/frame.jpg" required />
+        <p id="connection-error" role="alert"></p>
+        <div class="dialog-actions"><button type="button" id="local-source" class="text-button">Local source</button><button type="submit" class="primary-button"><i data-lucide="plug"></i>Connect</button></div>
+      </form>
+    </dialog>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
