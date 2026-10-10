@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -143,19 +144,35 @@ def save_detections(path, per_frame, labels, shape):
         mask=np.array([np.packbits(d.mask.reshape(-1)) for _, d in rows], dtype=np.uint8).reshape(len(rows), -1))
 
 
+class StoredDetections(Mapping):
+    """save_detections' file read back as {frame id: [Detection]}. Each frame's detections are made when asked
+    for: a long recording's masks, all unpacked, would take gigabytes."""
+
+    def __init__(self, path):
+        z = np.load(path)
+        self.labels, self.shape = [str(x) for x in z["labels"]], tuple(int(x) for x in z["shape"])
+        self._label, self._score, self._box, self._mask = z["label"], z["score"], z["box"], z["mask"]   # read once
+        self._rows = {int(k): [] for k in z["frames"]}
+        for i, k in enumerate(z["frame"].tolist()):
+            self._rows.setdefault(int(k), []).append(i)
+
+    def __getitem__(self, k):
+        h, w = self.shape
+        return [Detection(self.labels[self._label[i]] if self._label[i] >= 0 else "?", float(self._score[i]),
+                          tuple(float(v) for v in self._box[i]),
+                          np.unpackbits(self._mask[i])[:h * w].reshape(h, w).astype(bool)) for i in self._rows[k]]
+
+    def __iter__(self):
+        return iter(self._rows)
+
+    def __len__(self):
+        return len(self._rows)
+
+
 def load_detections(path):
     """{frame id: [Detection]} from save_detections' file (None if there is none)."""
     path = Path(path)
-    if not path.exists():
-        return None
-    z = np.load(path)
-    labels, (h, w) = [str(x) for x in z["labels"]], [int(x) for x in z["shape"]]
-    out = {int(k): [] for k in z["frames"]}
-    for i in range(len(z["frame"])):
-        m = np.unpackbits(z["mask"][i])[:h * w].reshape(h, w).astype(bool)
-        lab = labels[z["label"][i]] if z["label"][i] >= 0 else "?"
-        out.setdefault(int(z["frame"][i]), []).append(Detection(lab, float(z["score"][i]), tuple(float(v) for v in z["box"][i]), m))
-    return out
+    return StoredDetections(path) if path.exists() else None
 
 
 def detect_scan(folder, labels, weights=None, conf=0.2, refresh=False, log=print):
