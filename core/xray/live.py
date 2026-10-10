@@ -5,10 +5,12 @@ served to the glasses, the rover and the viewer.
     python -m xray.live --scan-seconds 20 --ask [--ball]      # Qwen-3D loads during the scan; ask, then "go" to track
     python -m xray.live --scan <scan folder> [--ball | --results <ground3d output>]  # an earlier scan, same session
     python -m xray.live --scan <scan> --replay <track folder> [--ball] [--speed 1]   # a recording instead of the phone
+                                                                     # (--loop: over and over, a fresh game each time)
 
 Endpoints, CORS on all (the same as replay_server.py, so the viewer and every client work unchanged):
-    /state          server-sent events: the newest state message, up to 10 a second
-    /state.json     the newest state message
+    /state          server-sent events: the newest state message, up to 10 a second; on a slow link fewer, never
+                    old ones (a small send buffer, so nothing queues up); ?cloud=0 leaves out the point clouds
+    /state.json     the newest state message (?cloud=0 as above)
     /frame.jpg      the newest x-ray image (JPEG); ?after=SEQ waits up to 2 s for a newer one; X-Seq, X-Age-Ms headers
     /scene          the scan: table, coloured cloud, and each object's twin (for the viewer's 3D view)
     /metrics        the Jetson's resource use (core/jetson)
@@ -46,6 +48,7 @@ import mimetypes
 import os
 import queue
 import shlex
+import socket
 import subprocess
 import sys
 import threading
@@ -150,25 +153,33 @@ def handler(server):
         def do_GET(self):
             url = urlsplit(self.path)
             path = unquote(url.path)
+            clouds = parse_qs(url.query).get("cloud", ["1"])[0].lower() not in ("0", "false", "no")
             if path == "/state":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
+                try:                                    # a small send buffer: a slow link gets fewer messages, never
+                    self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32 * 1024)   # old ones
+                    self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
                 last = None
                 try:
                     while True:
                         with server.cond:
                             server.cond.wait_for(lambda: server.state is not last, timeout=1.0)
                             state = last = server.state
+                        state = state if clouds else without_clouds(state)
                         self.wfile.write(("data: " + json.dumps(state, separators=(",", ":")) + "\n\n").encode())
-                        self.wfile.flush()
+                        self.wfile.flush()                  # (waits while the link is full; then the newest state)
                         time.sleep(0.1)
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, TimeoutError):
                     return
             elif path == "/state.json":
                 with server.cond:
                     state = server.state
+                state = state if clouds else without_clouds(state)
                 self.body(json.dumps(state, separators=(",", ":")).encode(), "application/json")
             elif path == "/frame.jpg":
                 try:
@@ -201,6 +212,18 @@ def handler(server):
                     return
                 self.body(file.read_bytes(), mimetypes.guess_type(file.name)[0] or "application/octet-stream", "no-cache")
     return Handler
+
+
+def without_clouds(state):
+    """The state without its point clouds (?cloud=0, for clients that don't draw them, such as the glasses)."""
+    out = {}
+    for key, v in state.items():                        # same keys in the same order (scene stays last)
+        if key == "objects":
+            v = [{k: x for k, x in o.items() if k != "point_cloud"} for o in v]
+        elif key == "scene":
+            v = {k: x for k, x in v.items() if k != "point_cloud"}
+        out[key] = v
+    return out
 
 
 def scene_json(scan, tracks, cut=(), table_z=None):
@@ -573,6 +596,7 @@ def main(argv=None):
     ap.add_argument("--replay", help="a recorded track folder instead of the phone (same world as --scan)")
     ap.add_argument("--speed", type=float, default=1.0, help="replay speed (0: as fast as possible)")
     ap.add_argument("--start", type=float, help="replay from this recording time (s)")
+    ap.add_argument("--loop", action="store_true", help="replay over and over (a fresh game each time), until Ctrl+C")
     ap.add_argument("--prompt", default=tk.rf.DEFAULT_PROMPT, help=f"detector labels (default \"{tk.rf.DEFAULT_PROMPT}\")")
     ap.add_argument("--ball", action="store_true", help="the shell game: balls under cups")
     ap.add_argument("--ask", action="store_true", help="Qwen-3D: load it at the start, ask questions after the scan, "
@@ -602,6 +626,8 @@ def main(argv=None):
     print(f"serving http://{args.host}:{args.port}/  (/state, /state.json, /frame.jpg, /scene, /metrics)", flush=True)
     if args.replay and not args.scan:
         ap.error("--replay needs the --scan of the same recording")
+    if args.loop and not args.replay:
+        ap.error("--loop is for --replay")
     labels = detect.parse_prompt(args.prompt)
     qwen = Qwen(out / "qwen", shlex.split(args.qwen_args), args.qwen_python and str(Path(args.qwen_python).expanduser())) \
         if args.ask else None                           # loads while the scan runs
@@ -644,26 +670,30 @@ def main(argv=None):
     objects, table = tk.scan_objects(scan, args.prompt, use_detector=False)
     print(f"scene: {len(objects)} objects, table at {table if table is None else round(table, 3)} m: "
           + ", ".join(f"{o['label']} at {tk.r4(o['position'])}" for o in objects), flush=True)
-    game = None
-    if args.ball:
-        cups, balls = shell.split(objects)
-        tracker = tk.Tracker(cups, table, labels={c["label"] for c in cups})
-        game = shell.ShellGame(tracker, balls, table, scan)
-    else:
-        tracker = tk.Tracker(objects, table)
     point, query = (answers[-1]["point"], answers[-1]["query"]) if answers else \
         qwen_target(args.results) if args.results else (None, None)
-    if point is not None:                               # the object the answer picked, tracked from now on
-        tr = tk.nearest(tracker.tracks, point)
-        ball = min(game.balls, key=lambda b: tk.distance(b.track.position, point)) if game is not None and game.balls else None
-        if ball is not None and (tr is None or tk.distance(ball.track.position, point) < tk.distance(tr.position, point)):
-            game.target, picked = ball, ball.id             # a ball: its cup is the target once it is hidden
+
+    def new_game():                                     # the tracker (and the game) as the scan left them
+        game = None
+        if args.ball:
+            cups, balls = shell.split(objects)
+            tracker = tk.Tracker(cups, table, labels={c["label"] for c in cups})
+            game = shell.ShellGame(tracker, balls, table, scan)
         else:
-            tracker.target_id = None if tr is None else tr.id
-            if game is not None:
-                game.chosen = tracker.target_id
-            picked = "none" if tr is None else f"{tr.label} {tr.id}"
-        print(f"target: '{query}' -> {picked}", flush=True)
+            tracker = tk.Tracker(objects, table)
+        if point is not None:                           # the object the answer picked, tracked from now on
+            tr = tk.nearest(tracker.tracks, point)
+            ball = min(game.balls, key=lambda b: tk.distance(b.track.position, point)) if game is not None and game.balls else None
+            if ball is not None and (tr is None or tk.distance(ball.track.position, point) < tk.distance(tr.position, point)):
+                game.target, picked = ball, ball.id         # a ball: its cup is the target once it is hidden
+            else:
+                tracker.target_id = None if tr is None else tr.id
+                if game is not None:
+                    game.chosen = tracker.target_id
+                picked = "none" if tr is None else f"{tr.label} {tr.id}"
+            print(f"target: '{query}' -> {picked}", flush=True)
+        return tracker, game
+    tracker, game = new_game()
     def make_scene():                                   # beside the tracking: it takes seconds, and /scene can wait
         try:
             server.scene = scene_json(scan, list(tracker.tracks), cut=[b.track for b in game.balls] if game else (),
@@ -690,13 +720,17 @@ def main(argv=None):
 
     def produce():                                      # thread 1: frames and their detections
         try:
-            for f in frames_from(source, args.start, args.speed):
-                if stop.is_set():
+            while True:
+                for f in frames_from(source, args.start, args.speed):
+                    if stop.is_set():
+                        break
+                    if to_world is not None:
+                        f.T = to_world @ f.T
+                    dets = cached.get(source.ids[f.index], []) if cached is not None else detector(f.rgb)
+                    offer(frames_q, (f, dets), newest=phone is not None)
+                if not args.loop or stop.is_set():
                     break
-                if to_world is not None:
-                    f.T = to_world @ f.T
-                dets = cached.get(source.ids[f.index], []) if cached is not None else detector(f.rgb)
-                offer(frames_q, (f, dets), newest=phone is not None)
+                offer(frames_q, "again")                # --loop: the recording from the start, a fresh game
         except Exception as e:                          # handed to the main thread
             offer(frames_q, e)
         offer(frames_q, None)
@@ -744,6 +778,10 @@ def main(argv=None):
                 break
             if isinstance(item, Exception):
                 raise item
+            if isinstance(item, str):                   # "again"
+                tracker, game = new_game()
+                verdict, last = None, None
+                continue
             f, dets = item
             tracker.update(f, dets)
             if game is not None:
