@@ -94,7 +94,7 @@ class Phone:
         self.ref_wh = None
         self.info = {}
 
-    def read(self, timeout=5.0):
+    def read(self, timeout=15.0):                            # (a stall while models load is not a stop)
         if self.stopped.is_set():
             raise RuntimeError("the phone stopped streaming")
         if not self.new.wait(timeout):
