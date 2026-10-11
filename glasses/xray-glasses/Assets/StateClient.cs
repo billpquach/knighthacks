@@ -2,24 +2,34 @@ using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Text;
-using System.Xml.Linq;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
 using UnityEngine.Networking;
 
 /// <summary>
-/// Reads the Jetson viewer's /state stream (server-sent events, about 10 Hz) and exposes the newest message.
-/// Works against replay_server.py on the laptop or the real Jetson at the same URL.
+/// Reads the /state stream (server-sent events, up to 10 a second) from xray.live on the Jetson or
+/// replay_server.py on the laptop (same endpoints) and exposes the newest message.
+/// v2: base URL can come from baseurl.txt (XrayConfig); the live point cloud ("scene", ~1500 points per
+/// message, only the web dashboard uses it) is cut off before parsing to keep the Beam Pro's frame rate up;
+/// Live tells whether a message arrived recently.
 /// </summary>
 public class StateClient : MonoBehaviour
 {
-    [Tooltip("Base URL with no trailing slash, e.g. http://192.168.1.50:8080")]
-    public string baseUrl = "http://192.168.1.50:8080";
+    [Tooltip("Base URL with no trailing slash, e.g. http://127.0.0.1:8080. baseurl.txt overrides it.")]
+    public string baseUrl = "http://127.0.0.1:8080";
+    [Tooltip("Stream path. ?cloud=0 asks xray.live to leave out the point clouds (replay_server.py ignores it).")]
+    public string statePath = "/state?cloud=0";
     public float reconnectDelay = 2f;
+    [Tooltip("Drop the per-message point cloud before parsing, if the server sent one anyway.")]
+    public bool stripScene = true;
+    [Tooltip("Seconds without a message before the stream counts as stale.")]
+    public float staleAfter = 3f;
 
+    public string BaseUrl { get; private set; }
     public JObject Latest { get; private set; }
-    public float LatestAt { get; private set; }
+    public float LatestAt { get; private set; } = -999f;
     public bool Connected { get; private set; }
+    public bool Live => Latest != null && Time.unscaledTime - LatestAt < staleAfter;
     public event Action<JObject> OnState;
 
     readonly ConcurrentQueue<string> inbox = new ConcurrentQueue<string>();
@@ -30,12 +40,14 @@ public class StateClient : MonoBehaviour
         readonly ConcurrentQueue<string> queue;
         readonly StringBuilder buffer = new StringBuilder();
         readonly Decoder decoder = Encoding.UTF8.GetDecoder();
+        public volatile bool gotData;
 
-        public SseHandler(ConcurrentQueue<string> q) : base(new byte[16384]) { queue = q; }
+        public SseHandler(ConcurrentQueue<string> q) : base(new byte[65536]) { queue = q; }
 
         protected override bool ReceiveData(byte[] data, int length)
         {
             if (data == null || length == 0) return false;
+            gotData = true;
             var chars = new char[length + 4];
             int n = decoder.GetChars(data, 0, length, chars, 0);
             buffer.Append(chars, 0, n);
@@ -58,6 +70,7 @@ public class StateClient : MonoBehaviour
         }
     }
 
+    void Awake() { BaseUrl = XrayConfig.ResolveBaseUrl(baseUrl); }
     void OnEnable() { StartCoroutine(Run()); }
     void OnDisable() { StopAllCoroutines(); Connected = false; }
 
@@ -65,16 +78,22 @@ public class StateClient : MonoBehaviour
     {
         while (true)
         {
-            using (var req = new UnityWebRequest(baseUrl + "/state", UnityWebRequest.kHttpVerbGET))
+            string path = string.IsNullOrEmpty(statePath) ? "/state" : statePath;
+            using (var req = new UnityWebRequest(BaseUrl + path, UnityWebRequest.kHttpVerbGET))
             {
-                req.downloadHandler = new SseHandler(inbox);
+                var handler = new SseHandler(inbox);
+                req.downloadHandler = handler;
                 req.SetRequestHeader("Accept", "text/event-stream");
                 req.timeout = 0; // never time out a live stream
-                Connected = true;
-                yield return req.SendWebRequest();
+                var op = req.SendWebRequest();
+                while (!op.isDone)
+                {
+                    Connected = handler.gotData;   // connected once bytes actually arrive
+                    yield return null;
+                }
                 Connected = false;
                 if (req.result != UnityWebRequest.Result.Success)
-                    Debug.LogWarning("StateClient: " + req.error);
+                    Debug.LogWarning("StateClient: " + req.error + " (" + BaseUrl + ")");
             }
             yield return new WaitForSecondsRealtime(reconnectDelay);
         }
@@ -83,11 +102,11 @@ public class StateClient : MonoBehaviour
     void Update()
     {
         string last = null;
-        while (inbox.TryDequeue(out var msg)) last = msg;
+        while (inbox.TryDequeue(out var msg)) last = msg;   // only the newest one matters
         if (last == null) return;
         try
         {
-            Latest = JObject.Parse(last);
+            Latest = Parse(last);
             LatestAt = Time.unscaledTime;
             OnState?.Invoke(Latest);
         }
@@ -95,5 +114,20 @@ public class StateClient : MonoBehaviour
         {
             Debug.LogWarning("StateClient parse error: " + e.Message);
         }
+    }
+
+    JObject Parse(string json)
+    {
+        if (stripScene)
+        {
+            // xray.live adds "scene" (the live cloud) as the message's last key: cut it off before parsing.
+            int i = json.LastIndexOf(",\"scene\":", StringComparison.Ordinal);
+            if (i > 0)
+            {
+                try { return JObject.Parse(json.Substring(0, i) + "}"); }
+                catch (Exception) { /* not where we expected: parse the whole thing */ }
+            }
+        }
+        return JObject.Parse(json);
     }
 }

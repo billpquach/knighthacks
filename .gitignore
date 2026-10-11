@@ -17,6 +17,7 @@ runs/
 **/track/
 *.mp4
 *.zip
+glasses/xray-glasses/Assets/_local/
 # models and weights -----------------------------------------------------------
 models/
 *.pt
