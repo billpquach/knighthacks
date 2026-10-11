@@ -312,14 +312,21 @@ def named_target(name, tracker, game):
     numbers = [int(w) for w in words if w.isdigit()]
     if numbers:
         tr = next((tr for tr in tracker.tracks if tr.id == numbers[0]), None)
-        return (tr, "") if tr is not None else (None, f"no cup {numbers[0]} (cups: "
-                                                      f"{', '.join(str(t.id) for t in tracker.tracks) or 'none'})")
+        return (tr, "") if tr is not None else (None, f"nothing numbered {numbers[0]} (tracked: "
+                                                      f"{', '.join(f'{t.label} {t.id}' for t in tracker.tracks) or 'none'})")
+    kinds = {tk.rf.kind(w) for w in words} - {None, "ball", "cup"}      # "the box": a kind with no number or colour
+    for k in kinds:
+        same = [tr for tr in tracker.tracks if tk.rf.kind(tr.label) == k]
+        if len(same) == 1:
+            return same[0], ""
+        if same:
+            return None, f"which {k}? ({', '.join(f'{k} {t.id}' for t in same)})"
     balls = list(game.balls) if game is not None else []
     colours = [w for w in words if w in BALL_BGR]
     ball = next((b for b in balls if colours and b.colour == colours[0]), None) if colours else \
         (balls[0] if "ball" in words and len(balls) == 1 else None)
     if ball is None:
-        known = [f"cup {t.id}" for t in tracker.tracks] + [b.id for b in balls]
+        known = [f"{t.label.split()[-1]} {t.id}" for t in tracker.tracks] + [b.id for b in balls]
         return None, f"don't know \"{name}\" (try: {', '.join(known) or 'nothing tracked yet'})"
     if ball.inside is not None:
         cup = next((tr for tr in tracker.tracks if tr.id == ball.inside), None)

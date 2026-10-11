@@ -61,7 +61,7 @@ def table_height(keyframes, lo=0.4, hi=1.2, cell=0.01, stride=8):
 
 
 def kind(text):
-    """cup / ball / can / None from a label or a target phrase."""
+    """cup / ball / can / box / None from a label or a target phrase."""
     words = set(str(text).lower().replace(",", " ").split())
     if words & {"ball", "balls"}:
         return "ball"
@@ -69,11 +69,13 @@ def kind(text):
         return "cup"
     if words & {"can", "cans", "soda"}:
         return "can"
+    if words & {"box", "boxes", "carton", "package"}:
+        return "box"
     return None
 
 
 def trim_radius(k, ball_diameter=0.064):
-    return {"cup": 0.06, "can": 0.05, "ball": ball_diameter / 2 + 0.01}.get(k)
+    return {"cup": 0.06, "can": 0.05, "ball": ball_diameter / 2 + 0.01, "box": 0.2}.get(k)
 
 
 def voxel_mean(p, size):
@@ -253,11 +255,61 @@ def complete_round(pts, want, table_z=None, slice_h=0.005, sector_deg=15, spacin
     return np.vstack([pts, add]), len(add)
 
 
+def box_frame(pts, table_z=None):
+    """A box standing on the table, from its points: (centre xyz, unit axes u and v on the floor, width along u,
+    length along v, bottom z, top z), or None. The footprint is the smallest rectangle around the points
+    (cv2.minAreaRect: from two seen sides and some of the top, the whole one); the bottom is the table."""
+    import cv2
+    if len(pts) < 100:
+        return None
+    xy = pts[:, :2]
+    r = np.hypot(*(xy - np.median(xy, axis=0)).T)
+    core = xy[r <= np.percentile(r, 99)]                    # (stray points don't widen it; corners kept)
+    corners = cv2.boxPoints(cv2.minAreaRect(core.astype(np.float32))).astype(float)
+    e1, e2 = corners[1] - corners[0], corners[2] - corners[1]
+    w, l = float(np.linalg.norm(e1)), float(np.linalg.norm(e2))
+    z0 = table_z if table_z is not None else float(np.percentile(pts[:, 2], 1))
+    z1 = float(np.percentile(pts[:, 2], 99))
+    if min(w, l) < 0.03 or z1 - z0 < 0.02:                  # a sliver (one face seen edge-on), or flat
+        return None
+    return np.r_[corners.mean(axis=0), (z0 + z1) / 2], e1 / w, e2 / l, w, l, z0, z1
+
+
+def complete_box(pts, table_z=None, spacing=0.006, seen=0.012, seed=0):
+    """A box is a cuboid standing on the table (box_frame): the top and the sides the scan never saw are filled
+    in, every `spacing` m where no seen point lies within `seen` m: the whole box. Returns (points, how many were
+    added)."""
+    frame = box_frame(pts, table_z)
+    if frame is None:
+        return pts, 0
+    centre, u, v, w, l, z0, z1 = frame
+    c = centre[:2]
+    s = np.arange(-w / 2, w / 2 + 1e-9, spacing)
+    t = np.arange(-l / 2, l / 2 + 1e-9, spacing)
+    zs = np.arange(z0 + spacing, z1 + 1e-9, spacing)
+    S, T = np.meshgrid(s, t)
+    faces = [np.c_[c + S.reshape(-1, 1) * u + T.reshape(-1, 1) * v, np.full(S.size, z1)]]       # the top
+    for along, dirn, normal, half in ((s, u, v, l / 2), (t, v, u, w / 2)):                   # the four sides
+        A, Z = np.meshgrid(along, zs)
+        for sign in (-1, 1):
+            faces.append(np.c_[c + A.reshape(-1, 1) * dirn + sign * half * normal, Z.reshape(-1)])
+    cand = np.vstack(faces)
+    cells = {tuple(k) for k in np.floor(pts / seen).astype(np.int64)}
+    keys = np.floor(cand / seen).astype(np.int64)
+    near_seen = np.array([any((k[0] + i, k[1] + j, k[2] + m) in cells for i in (-1, 0, 1) for j in (-1, 0, 1)
+                              for m in (-1, 0, 1)) for k in keys], bool)
+    add = cand[~near_seen]
+    if not len(add):
+        return pts, 0
+    add = add + np.random.default_rng(seed).normal(0, 0.0012, add.shape)   # (no visible grid)
+    return np.vstack([pts, add]), len(add)
+
+
 def refine(seed_points, keyframes, table_z=None, label=None, dets=None, ball_diameter=0.064, seed_cell=0.02,
            radius=0.015, above_table=0.01, thin=0.005, join=0.015, outliers=False, max_depth=3.0, complete=True):
     """dets: one list of xray.detect Detections per keyframe (or None). label: the object's label or target
     phrase (decides which detections fit and the size trim). complete: a cup's or ball's unseen sides filled in
-    by symmetry (complete_round)."""
+    by symmetry (complete_round), a box's as a cuboid (complete_box)."""
     t0 = time.time()
     want = kind(label) if label else None
     seed = voxel_mean(np.asarray(seed_points, float).reshape(-1, 3), seed_cell)
@@ -290,10 +342,14 @@ def refine(seed_points, keyframes, table_z=None, label=None, dets=None, ball_dia
             pts = pts[drop_outliers(pts)]
     filled = 0
     if complete and len(pts):
-        pts, filled = complete_round(pts, want, table_z)
+        pts, filled = complete_box(pts, table_z) if want == "box" else complete_round(pts, want, table_z)
     out = dict(points=pts, n_points=int(len(pts)), filled=filled, views=views, masked_views=masked, kind=want,
                table_z=table_z, seed_points=int(len(seed)), seconds=round(time.time() - t0, 2))
-    if len(pts):
+    frame = box_frame(pts, table_z) if want == "box" and filled else None
+    if frame is not None:                                   # a box: the cuboid's own centre and size
+        centre, u, v, w, l, z0, z1 = frame
+        out.update(center=np.round(centre, 4).tolist(), size=[round(w, 4), round(l, 4), round(z1 - z0, 4)])
+    elif len(pts):
         out.update(center=np.round(np.median(pts, axis=0), 4).tolist(),
                    size=np.round(np.percentile(pts, 95, axis=0) - np.percentile(pts, 5, axis=0), 4).tolist())
     else:
