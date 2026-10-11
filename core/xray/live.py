@@ -316,7 +316,7 @@ def drive_step(server, rover, nav, tracker, game, f, log=print):
     if tr is None:
         nav.stop("lost")
     else:
-        rover.drive(*nav.step(f.T, tr.position, tr.radius))
+        rover.drive(*nav.step(f.T, tr.position, tr.radius), yaw=rv.heading(f.T))
     if not nav.active:
         rover.stop()
         log(f"rover: {nav.state}" + (f", {nav.info.get('distance_m', 0) * 100:.0f} cm from {nav.target_id}'s edge"
@@ -561,7 +561,7 @@ def scan_with_phone(phone, seconds, out, server, min_keyframes=20, rover=None, r
 
     def progress(f, n, left):
         if rover is not None and routine is not None and not routine.done:
-            rover.drive(*routine.step(f.T))                 # (the phone's own pose steers it)
+            rover.drive(*routine.step(f.T), yaw=rv.heading(f.T))      # (the phone's own pose steers it)
             if routine.done:
                 rover.stop()
                 log(f"rover: scan moves done, {n} views so far")
