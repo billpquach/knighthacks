@@ -491,7 +491,7 @@ def decision_card(img, a):
     cv2.putText(img, "QWEN-3D", (x0 + 8, y0 + 18), font, 0.42, AMBER, 1, cv2.LINE_AA)
     cv2.putText(img, f"'{a['query']}'"[:44], (x0 + 76, y0 + 18), font, 0.42, TEXT, 1, cv2.LINE_AA)
     cv2.putText(img, f"-> {a.get('target') or 'object'}  {100 * a['score']:.0f}%", (x0 + 8, y0 + 44), font, 0.6, AMBER, 1, cv2.LINE_AA)
-    info = f"{a['seconds']:.1f} s on the Jetson, 8-bit" + (f", {a['ram_gb']:.1f} GB" if a.get("ram_gb") else "")
+    info = f"{a['seconds']:.1f} s on the Jetson, {a.get('bits') or 8}-bit" + (f", {a['ram_gb']:.1f} GB" if a.get("ram_gb") else "")
     cv2.putText(img, info, (x0 + 8, y0 + 64), font, 0.4, TEXT, 1, cv2.LINE_AA)
     top = (a.get("top5") or [a["score"]])[:5]
     bw = (x1 - x0 - 16) // max(1, len(top))
@@ -1033,7 +1033,7 @@ def ask_phase(qwen, scan, server, frames, log=print, hold=None):
                 good = which == "refined"                   # (the dense cloud's centre and size, if it is one)
                 point = ref.get("center") if good else a["center"]
                 answers.append(dict(a, point=point, points=pts, which=which, size=ref.get("size") if good else a.get("size"),
-                                    ram_gb=res.get("ram_gb"), arrived=time.monotonic(),
+                                    ram_gb=res.get("ram_gb"), bits=res.get("bits") or 8, arrived=time.monotonic(),
                                     candidates=[dict(c, points=np.asarray(c["points"], float)) for c in a.get("candidates") or []],
                                     heat=np.asarray(a.get("heat") or np.zeros((0, 4)), float).reshape(-1, 4)))
                 if seq > requests["cancelled"]:             # (not cancelled meanwhile) the countdown to the handoff
@@ -1101,7 +1101,8 @@ def ask_phase(qwen, scan, server, frames, log=print, hold=None):
             if last is not None:                        # the view says what happens next while YOLOE loads
                 img, msg = last
                 tag(img, "go: Qwen-3D exits, YOLOE tracking starts", (img.shape[1] // 2, img.shape[0] - 24), AMBER, 0.6)
-                server.publish(img, dict(msg, phase="starting", qwen=dict(msg["qwen"], status="done")))
+                server.publish(img, dict(msg, phase="starting", qwen=dict(msg["qwen"], status="done", thinking=None,
+                                                                          driving_in=None, sweep=None)))
             break
         if time.monotonic() - shown < 1 / 15:           # the phone sends 60 a second: 15 leave the CPU to Qwen-3D
             continue
@@ -1160,7 +1161,8 @@ def ask_phase(qwen, scan, server, frames, log=print, hold=None):
                    qwen=dict(status=status, ready=qwen.ready(), thinking=busy[0], sweep=sweep,
                              driving_in=None if pending[0] is None else round(max(0.0, pending[0][1] - time.monotonic()), 1),
                              answers=[{k: a.get(k) for k in ("query", "target", "score", "band", "seconds", "point", "top5",
-                                                             "llm_seconds", "tokens", "gpu_peak_gb", "ram_gb")} for a in answers]))
+                                                             "llm_seconds", "tokens", "gpu_peak_gb", "ram_gb", "bits")}
+                                      for a in answers]))
         server.publish(img, msg)
         last = img, msg
     asked.put(None)

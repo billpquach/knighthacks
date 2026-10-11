@@ -396,7 +396,8 @@ def serve(g, jobs, parent, ram, args):
         except Exception as e:                              # the live runner reads the error and falls back
             res["error"] = ("OUT OF MEMORY: " if is_oom(e) else "") + f"{type(e).__name__}: {str(e).splitlines()[0][:300]}"
             print(res["error"], flush=True)
-        res.update(seconds_after_job=round(time.time() - t, 1), ram_peak_gb=round(ram.peak, 2), ram_gb=round(ram.now, 2))
+        res.update(seconds_after_job=round(time.time() - t, 1), ram_peak_gb=round(ram.peak, 2), ram_gb=round(ram.now, 2),
+                   bits=args.bits)
         (jobs / "result.tmp").write_text(json.dumps(res, indent=2))
         (jobs / "result.tmp").rename(jobs / "result.json")
         if not job.get("more"):
