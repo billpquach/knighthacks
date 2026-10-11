@@ -41,6 +41,24 @@ python -m xray.live --scan <rec>/scan --replay <rec>/track --ball          # the
 python -m xray.track <rec>/track --scan <rec>/scan --ball                  # tracker + game only -> states.jsonl
 ```
 
+### Rover
+
+Two DC motors on an L298N, driven by an Arduino Uno over USB (`rover/rover.ino`) and steered by the phone's own
+pose (ARKit, in the scan's world): no wheel encoders. Wiring and the serial commands are at the top of the sketch
+(ENA D5, IN1 D7, IN2 D8, ENB D6, IN3 D9, IN4 D10; take the ENA/ENB jumpers off; common ground). Upload it with the
+Arduino IDE, then on the Jetson (`pip install pyserial`; the Uno is `/dev/ttyACM0`, `sudo usermod -aG dialout $USER`):
+
+```bash
+python -m xray.rover ping                     # the Arduino answers
+python -m xray.rover test                     # each wheel forward then back: fix directions in rover.ino if needed
+python -m xray.rover drive 120 120 1          # straight ahead for 1 s (find the least power that moves it)
+python -m xray.live --scan-seconds 25 --ball --rover --rover-scan    # scans by itself; "drive" fetches the target
+```
+
+While tracking, `drive` (typed, or `POST /prompt`) drives to the target (the hidden ball's cup, or Qwen-3D's
+answer) and stops 12 cm short; `stop` stops. `--rover dry` logs the commands instead (any replay). `--rover-power
+TURN DRIVE MIN` sets the wheel power. The Arduino stops the motors if the Jetson goes quiet for 0.4 s.
+
 The stages: `xray.scan` (keyframes), `ground3d` (Qwen-3D INIT and `refine`: each object's digital twin),
 `xray.detect` (YOLOE), `xray.track` (3D tracking with object permanence), `xray.shell` (balls under cups),
 `xray.render` (the x-ray look) and `xray.live` (all of it, live).
