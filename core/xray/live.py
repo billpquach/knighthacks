@@ -236,6 +236,9 @@ def handler(server):
                     version=1, device=None, memory_kind="shared", available=False, reason="not_jetson", metrics={},
                     age_ms=None, sample_id=None)
                 self.body(json.dumps(latest).encode(), "application/json")
+            elif path == "/favicon.ico":                  # (browsers ask; nothing to send)
+                self.send_response(204)
+                self.end_headers()
             elif path == "/viewer-info":
                 self.body(json.dumps({"mode": "live"}).encode(), "application/json")
             else:
