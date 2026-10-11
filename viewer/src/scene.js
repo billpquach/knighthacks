@@ -4,6 +4,28 @@ import { calibrate, G8_LENS, validLens } from './calibration.js';
 
 const colors = { yellow: 0xf4d06c, green: 0x91dc83, red: 0xff8877, purple: 0xd89fec, blue: 0x8cbafa };
 const hidden = o => o.state !== 'VISIBLE';
+// The memory map is drawn from above with an orthographic camera, where point sizes are pixels, not metres.
+const MAP_PX = { environment: 2.6, live: 1.6, occluder: 2.6, object: 3.6, ball: 4.6 };
+
+// Confidence 0..1 -> deep blue, cyan, amber, white (the camera view's colours).
+function heatColor(h) {
+  const stops = [[0, .04, .16, .47], [.35, .16, .78, .9], [.7, 1, .75, .16], [1, 1, .98, .92]];
+  let i = 1;
+  while (i < stops.length - 1 && h > stops[i][0]) i++;
+  const [a, b] = [stops[i - 1], stops[i]], t = Math.min(1, Math.max(0, (h - a[0]) / (b[0] - a[0])));
+  return [1, 2, 3].map(k => a[k] + (b[k] - a[k]) * t);
+}
+
+// X-ray blue-cyan by height above the table: the surface dark, anything standing on it bright. Bluer than the
+// objects' teal and yellow, so they stand out on it.
+function xrayColors(points, tableZ) {
+  const out = new Float32Array(points.length * 3);
+  points.forEach(([, , z], i) => {
+    const t = Math.min(1, Math.max(0, (z - tableZ + 0.03) / 0.25));
+    out.set([0.05 + 0.3 * t, 0.16 + 0.55 * t, 0.3 + 0.65 * t], i * 3);
+  });
+  return out;
+}
 
 export class RobotScene {
   constructor(container, labels) {
@@ -24,6 +46,9 @@ export class RobotScene {
     container.append(this.renderer.domElement);
     this.content = new THREE.Group();
     this.scene.add(this.content);
+    this.healGroup = new THREE.Group();               // the scan's holes, filled in from live depth
+    this.scene.add(this.healGroup);
+    this.heal = null;
     this.labelItems = [];
     this.observer = new ResizeObserver(() => this.resize());
     this.observer.observe(container);
@@ -74,19 +99,64 @@ export class RobotScene {
     this.staticScene = data;
     this.mapBounds = null;
     this.lens = validLens(data?.camera) ? data.camera : G8_LENS;
+    this.envRobot = this.envMap = null;
     if (data) {
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.Float32BufferAttribute(data.cloud.points.flat(), 3));
-      this.environment.add(new THREE.Points(geometry, new THREE.PointsMaterial({ color: 0x929292,
-        size: .008, transparent: true, opacity: .48, depthWrite: false })));
+      this.envRobot = new THREE.Points(geometry, new THREE.PointsMaterial({ color: 0x929292,
+        size: .008, transparent: true, opacity: .48, depthWrite: false }));
+      const mapGeometry = geometry.clone();
+      mapGeometry.setAttribute('color', new THREE.Float32BufferAttribute(xrayColors(data.cloud.points, data.table.z), 3));
+      this.envMap = new THREE.Points(mapGeometry, new THREE.PointsMaterial({ vertexColors: true, size: MAP_PX.environment,
+        sizeAttenuation: false, transparent: true, opacity: .85, depthWrite: false }));
+      this.environment.add(this.envRobot, this.envMap);
       const outline = data.table.outline.map(p => new THREE.Vector3(...p, data.table.z));
       if (outline.length >= 3) this.environment.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(outline),
         new THREE.LineBasicMaterial({ color: 0xaaaaaa, transparent: true, opacity: .4 })));
-      if (outline.length) this.mapBounds = new THREE.Box3().setFromPoints(outline);
-      else if (data.cloud.points.length) this.mapBounds = new THREE.Box3().setFromBufferAttribute(geometry.attributes.position);
+      // The map frames the objects (and the robot, added on the next update), not the whole scan.
+      // (no objects in the scene yet: the next update frames the state's objects, e.g. Qwen-3D's answers)
+      if (data.objects.length) this.mapBounds = new THREE.Box3().setFromPoints(data.objects.map(o => new THREE.Vector3(...o.position)));
     }
     if (this.lastState) this.update(this.lastState, this.lastTarget);
     this.resize();
+  }
+
+  // Points where objects stood, seen bare since: each arrives bright and settles into the scan's colour.
+  setHeal(points, ages = []) {
+    this.healGroup.traverse(node => { node.geometry?.dispose(); node.material?.dispose(); });
+    this.healGroup.clear();
+    this.heal = null;
+    if (!points.length) return;
+    const now = performance.now() / 1000;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(points.flat(), 3));
+    geometry.setAttribute('color', new THREE.Float32BufferAttribute(new Float32Array(points.length * 3), 3));
+    const robot = new THREE.Points(geometry, new THREE.PointsMaterial({ vertexColors: true, size: .008,
+      transparent: true, opacity: .7, depthWrite: false }));
+    const map = new THREE.Points(geometry, new THREE.PointsMaterial({ vertexColors: true, size: MAP_PX.environment + .6,
+      sizeAttenuation: false, transparent: true, opacity: .9, depthWrite: false }));
+    this.healGroup.add(robot, map);
+    const tableZ = this.staticScene?.table?.z ?? 0;
+    this.heal = { robot, map, born: points.map((_, i) => now - (Number.isFinite(ages[i]) ? ages[i] : 9)),
+      base: { robot: [0.57, 0.57, 0.57], map: Array.from(xrayColors([[0, 0, tableZ]], tableZ)) } };
+    this.tintHeal(true);
+  }
+
+  tintHeal(force = false) {
+    const h = this.heal;
+    if (!h) return;
+    const now = performance.now() / 1000;
+    if (!force && now - Math.max(...h.born) > 3) return;          // all settled: nothing to redraw
+    const map = this.view === 'map';
+    h.robot.visible = !map; h.map.visible = map;
+    const base = map ? h.base.map : h.base.robot, fresh = [0.85, 1, 1];
+    const colors = h.robot.geometry.attributes.color;
+    h.born.forEach((b, i) => {
+      const k = Math.exp(-(now - b) / 0.8);                       // bright when it arrives, settled after ~2 s
+      colors.setXYZ(i, ...base.map((c, j) => c + (fresh[j] - c) * k));
+    });
+    colors.needsUpdate = true;
+    this.dirty = true;
   }
 
   clear() {
@@ -101,15 +171,40 @@ export class RobotScene {
     this.labelItems = [];
   }
 
-  points(positions, color, size, xray = false, opacity = 1) {
+  points(positions, color, size, xray = false, opacity = 1, mapPx = MAP_PX.object) {
     if (!positions.length) return;
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    const material = new THREE.PointsMaterial({ color, size, transparent: true, opacity,
-      depthTest: !xray, depthWrite: !xray, sizeAttenuation: true });
+    const map = this.view === 'map';
+    const material = new THREE.PointsMaterial({ color, size: map ? mapPx : size, transparent: true, opacity,
+      depthTest: !xray, depthWrite: !xray, sizeAttenuation: !map });
     const points = new THREE.Points(geometry, material);
     points.renderOrder = xray ? 3 : 0;
     this.content.add(points);
+  }
+
+  // Points each with its own colour (Qwen-3D's confidence sweep).
+  coloredPoints(positions, colors, size, opacity, mapPx) {
+    if (!positions.length) return;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    const map = this.view === 'map';
+    const points = new THREE.Points(geometry, new THREE.PointsMaterial({ vertexColors: true, size: map ? mapPx : size,
+      transparent: true, opacity, depthTest: false, depthWrite: false, sizeAttenuation: !map }));
+    points.renderOrder = 4;
+    this.content.add(points);
+  }
+
+  // A small score tag (an answer Qwen-3D weighed and passed over).
+  scoreLabel(position, text) {
+    const el = document.createElement('div');
+    el.className = 'object-label candidate';
+    const title = document.createElement('span');
+    title.textContent = text;
+    el.append(title);
+    this.labels.append(el);
+    this.labelItems.push({ el, title, position: new THREE.Vector3(...position), name: text, selected: false });
   }
 
   box(object, color, solid = false) {
@@ -167,6 +262,12 @@ export class RobotScene {
       : validLens(this.staticScene?.camera) ? this.staticScene.camera : G8_LENS;
     if (!this.mapBounds) this.mapBounds = new THREE.Box3().setFromPoints(
       [...state.objects, ...state.balls, { position: pose.position }].map(o => new THREE.Vector3(...o.position)));
+    else if (!this.mapBounds.robot) {                   // the robot stays in the frame too
+      this.mapBounds.expandByPoint(new THREE.Vector3(...pose.position));
+      this.mapBounds.robot = true;
+    }
+    if (this.envRobot) { this.envRobot.visible = this.view !== 'map'; this.envMap.visible = this.view === 'map'; }
+    this.tintHeal(true);
     this.frameCamera();
 
     const floor = Number.isFinite(state.scene?.floor_z) ? state.scene.floor_z : 0;
@@ -176,21 +277,36 @@ export class RobotScene {
     grid.material.transparent = true;
     grid.material.opacity = 0.38;
     this.content.add(grid);
-    this.points(cloudPositions(state.scene?.point_cloud), 0x637b71, 0.003, false, 0.45);
+    this.points(cloudPositions(state.scene?.point_cloud), 0x637b71, 0.003, false, 0.45, MAP_PX.live);
 
     for (const occluder of state.occluders) {
       this.box(occluder, 0x9da99f, true);
-      this.points(cloudPositions(occluder.point_cloud, occluder.position), 0x9da99f, 0.0028, false, 0.5);
+      this.points(cloudPositions(occluder.point_cloud, occluder.position), 0x9da99f, 0.0028, false, 0.5, MAP_PX.occluder);
     }
     let clouds = !!this.staticScene?.cloud.points.length;
+    // Qwen-3D's confidence sweep: every point it weighed glows as strongly as it believed in it, then fades.
+    const sweep = state.qwen?.sweep;
+    if (Array.isArray(sweep?.heat) && sweep.heat.length && sweep.age_s < sweep.duration_s) {
+      const fade = Math.min(1, 2 * (1 - sweep.age_s / sweep.duration_s));
+      const heat = sweep.heat.filter(p => Array.isArray(p) && p.length === 4 && p.every(Number.isFinite));
+      this.coloredPoints(heat.flatMap(p => p.slice(0, 3)), heat.flatMap(p => heatColor(p[3])), 0.004, 0.9 * fade, MAP_PX.ball + 1);
+    }
     for (const object of [...state.objects, ...state.balls]) {
       const selected = target?.id === object.id;
       const color = colors[object.color] ?? (hidden(object) ? 0xf4d06c : 0x73e6d3);
+      for (const c of Array.isArray(object.candidates) ? object.candidates : []) {   // what it passed over
+        if (!vector(c.position)) continue;
+        this.points(cloudPositions(c.point_cloud), 0xc9d4de, 0.0018, true, 0.4, MAP_PX.object - 1);
+        this.scoreLabel(c.position, `${Math.round(100 * (c.score || 0))}%`);
+      }
+      // (the answer itself appears once the sweep has narrowed down to it)
+      if (sweep?.answer === object.id && sweep.age_s < 0.4 * sweep.duration_s) { this.label(object, selected); continue; }
       const model = this.staticScene?.objects.find(o => o.id === object.id);
       const points = cloudPositions(model?.points.length ? { frame: 'object', points: model.points } : object.point_cloud, object.position, 2000);
       if (points.length) {
         clouds = true;
-        this.points(points, color, object.color ? 0.0025 : 0.0019, true, hidden(object) ? 0.9 : 0.75);
+        this.points(points, color, object.color ? 0.0025 : 0.0019, true, hidden(object) ? 0.9 : 0.75,
+          object.color ? MAP_PX.ball : MAP_PX.object);
       } else this.box(object, color);
       this.label(object, selected);
     }

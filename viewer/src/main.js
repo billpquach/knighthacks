@@ -18,7 +18,7 @@ let state, target, selectedId = null, paused = false, source, events, generation
 let frameController, frameTimer, currentImageUrl, lastImageAt = 0, lastSeq = null, listKey = '';
 let mode = 'unknown', receivedValidState = false;
 let framePath = '/frame.jpg';
-let sceneRequest = 0, fileScene = false;
+let sceneRequest = 0, fileScene = false, sceneVersion, healVersion, healBusy = false;
 let pendingState = null;
 let objectFilter = 'all';
 
@@ -66,6 +66,18 @@ function projection(view) {
 $('map-view').onclick = () => projection('map');
 $('robot-view').onclick = () => projection('robot');
 projection('robot');
+
+async function fetchHeal(token, version) {
+  healBusy = true;
+  try {
+    const response = await fetch(`${source}/scene/heal`, { cache: 'no-store', signal: AbortSignal.timeout(5000) });
+    if (!response.ok) throw new Error('No heal');
+    const data = await response.json();
+    if (token !== generation || !Array.isArray(data.points)) return;
+    healVersion = version;
+    scene?.setHeal(data.points.filter(p => Array.isArray(p) && p.length === 3 && p.every(Number.isFinite)), data.age_s);
+  } catch { /* the next message retries */ } finally { healBusy = false; }
+}
 
 async function fetchScene(token) {
   if (fileScene) return;
@@ -122,8 +134,37 @@ function status(label, good = false) {
   $('status-dot').className = `status-dot ${good ? 'good' : 'bad'}`;
 }
 
+// The newest Qwen-3D answer while questions are asked: what was asked, what it picked, how sure, how fast,
+// and its top scores (the first one picked).
+function decisionCard() {
+  let card = $('qwen-card');
+  const a = state?.phase === 'ask' ? state.qwen?.answers?.at(-1) : null;
+  if (!a) { if (card) card.hidden = true; return; }
+  if (!card) {
+    card = document.createElement('div'); card.id = 'qwen-card';
+    card.innerHTML = '<div class="qc-head">QWEN-3D <span class="qc-query"></span></div><div class="qc-pick"></div>'
+      + '<div class="qc-info"></div><div class="qc-bars"></div>';
+    $('spatial-panel').append(card);
+  }
+  card.hidden = false;
+  card.querySelector('.qc-query').textContent = `"${a.query}"`;
+  card.querySelector('.qc-pick').textContent = `\u2192 ${a.target || 'object'}  ${Math.round(100 * a.score)}%`;
+  const info = [`${Number(a.seconds).toFixed(1)} s on the Jetson`, '8-bit 3B VLM'];
+  if (Number.isFinite(a.ram_gb)) info.push(`${a.ram_gb.toFixed(1)} GB`);
+  if (Number.isFinite(a.tokens)) info.push(`${a.tokens} tokens`);
+  card.querySelector('.qc-info').textContent = info.join(' \u00b7 ');
+  const top = (Array.isArray(a.top5) && a.top5.length ? a.top5 : [a.score]).slice(0, 5);
+  card.querySelector('.qc-bars').replaceChildren(...top.map((score, i) => {
+    const bar = document.createElement('div'); bar.className = `qc-bar${i ? '' : ' picked'}`;
+    bar.innerHTML = `<span></span><i style="width:${Math.round(100 * Math.min(1, score))}%"></i>`;
+    bar.firstChild.textContent = score.toFixed(2);
+    return bar;
+  }));
+}
+
 function display(force = false) {
   if (!state || (paused && !force)) return;
+  decisionCard();
   if (selectedId !== null && ![...state.objects, ...state.balls].some(object => String(object.id) === selectedId)) selectedId = null;
   target = resolveTarget(state, selectedId);
   const geometry = scene?.update(state, target);
@@ -231,7 +272,7 @@ async function pollFrame(token) {
 
 async function connect(url) {
   const token = ++generation;
-  ++sceneRequest; fileScene = false; $('scene-file').value = '';
+  ++sceneRequest; fileScene = false; sceneVersion = healVersion = undefined; scene?.setHeal([]); $('scene-file').value = '';
   source = sourceUrl(url);
   try { resources.connect(metricsUrl(resourceUrl, source)); }
   catch { resourceUrl = ''; resources.connect(`${source}/metrics`); }
@@ -259,10 +300,20 @@ async function connect(url) {
   events.onmessage = message => {
     if (token !== generation) return;
     try {
-      const previousPhase = pendingState?.phase;
+      const previousPhase = pendingState?.phase, wasReady = !!pendingState?.qwen?.ready;
       pendingState = normalizeState(JSON.parse(message.data));
       if (!pendingState.replay?.camera && !paused) state = pendingState;
-      if (pendingState.phase === 'track' && previousPhase !== 'track') fetchScene(token);
+      // The live server counts /scene versions: fetch whenever it changes (it is built while tracking starts).
+      // Servers without it: fetch when tracking starts.
+      const version = pendingState.scene_version;
+      if (Number.isFinite(version) ? version > 0 && version !== sceneVersion : pendingState.phase === 'track' && previousPhase !== 'track') {
+        sceneVersion = version; fetchScene(token);
+      }
+      // The memory graph marks Qwen-3D arriving and leaving (its memory handed to YOLOE).
+      if (pendingState.qwen?.ready && !wasReady) resources.mark('Qwen-3D loaded');
+      if (previousPhase === 'ask' && pendingState.phase !== 'ask') resources.mark('Qwen-3D freed for YOLOE');
+      // The scan's holes (where objects stood) fill in from live depth: fetch the patch when it grows.
+      if (Number.isFinite(pendingState.heal_version) && pendingState.heal_version !== healVersion && !healBusy) fetchHeal(token, pendingState.heal_version);
       lastStateAt = performance.now(); receivedValidState = true;
       if (pendingState.source === 'synthetic' || pendingState.source === 'replay') mode = pendingState.source;
       const label = mode === 'synthetic' ? 'SIMULATION' : mode === 'replay' ? 'REPLAY' : 'CONNECTED';
