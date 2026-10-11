@@ -873,6 +873,45 @@ def ram_in_use_gb():
 
 
 RAM_LIMIT_GB = 6.3                                      # the 8 GB Jetson's practical ceiling (its GPU allocator fails above)
+OOM_SIGNS = ("NVML_SUCCESS", "out of memory", "OUT OF MEMORY", "NvMap", "Killed")
+
+
+def leftover_qwen():
+    """Qwen-3D servers already running: [(pid, its runner's pid, whether that runner is still an xray.live)]."""
+    out = []
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit() or int(d.name) == os.getpid():
+            continue
+        try:
+            cmd = (d / "cmdline").read_bytes().split(b"\0")
+            if not any(b"ground3d.ground" in c for c in cmd) or b"--serve" not in cmd:
+                continue
+            ppid = int((d / "stat").read_text().rsplit(")", 1)[1].split()[1])
+            runner = (Path("/proc") / str(ppid) / "cmdline").read_bytes() if ppid > 1 else b""
+            out.append((int(d.name), ppid, b"xray.live" in runner))
+        except (OSError, ValueError, IndexError):
+            pass
+    return out
+
+
+def free_for_qwen(log=print):
+    """Before Qwen-3D loads: stop servers left over from earlier runs (their runner is gone, their memory isn't),
+    and warn if memory is already short (it needs ~4-5 GB of the board's ~6.3)."""
+    for pid, ppid, alive in leftover_qwen():
+        if alive:
+            log(f"warning: another run's Qwen-3D is running (pid {pid}, run pid {ppid}): two won't fit; stop that run")
+            continue
+        try:
+            os.kill(pid, 9)
+            log(f"stopped a Qwen-3D left over from an earlier run (pid {pid}): its memory is free again")
+            time.sleep(2)
+        except OSError:
+            pass
+    ram = ram_in_use_gb()
+    if ram is not None and ram > 1.8:
+        log(f"warning: {ram:.2f} GB of memory already in use before Qwen-3D loads (a fresh boot without the desktop: "
+            "~1 GB). It may run out: free other programs (ps aux --sort=-rss | head), or reboot and "
+            "'sudo systemctl isolate multi-user.target'")
 
 
 def camera_block(T):
@@ -914,8 +953,12 @@ def wait_for_start(server, phone, qwen, yoloe, log=print):
         loading = []
         if qwen is not None and not qwen.ready():
             if not qwen.alive():
+                tail = qwen.note(last=8)
+                hint = ("\nIt ran out of memory. Stop leftovers (pkill -f ground3d.ground; pkill -f xray.live), "
+                        "check 'free -h' (used ~1 GB), or reboot without the desktop; then start again"
+                        if any(s in tail for s in OOM_SIGNS) else "")
                 raise SystemExit(f"Qwen-3D stopped while loading; the end of {qwen.folder / 'qwen.log'}:\n  "
-                                 + qwen.note(last=8).replace(" | ", "\n  "))
+                                 + tail.replace(" | ", "\n  ") + hint)
             loading.append(f"Qwen-3D {time.time() - qwen.t0:.0f} s")
         if yoloe is not None and not yoloe.is_set():
             loading.append("YOLOE")
@@ -1231,6 +1274,8 @@ def main(argv=None):
                        front=args.rover_size[0], width=args.rover_size[1])
     read_console(server)
     labels = detect.parse_prompt(args.prompt)
+    if args.ask:
+        free_for_qwen()
     qwen = Qwen(out / "qwen", shlex.split(args.qwen_args), args.qwen_python and str(Path(args.qwen_python).expanduser())) \
         if args.ask else None                           # loads while the scan runs
     if qwen is not None:
