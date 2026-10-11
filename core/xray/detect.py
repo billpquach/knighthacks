@@ -141,7 +141,7 @@ def save_detections(path, per_frame, labels, shape):
         label=np.array([list(labels).index(d.label) if d.label in labels else -1 for _, d in rows], dtype=np.int64),
         score=np.array([d.score for _, d in rows], dtype=np.float32),
         box=np.array([d.box for _, d in rows], dtype=np.float32).reshape(-1, 4),
-        mask=np.array([np.packbits(d.mask.reshape(-1)) for _, d in rows], dtype=np.uint8).reshape(len(rows), -1))
+        mask=np.array([np.packbits(d.mask.reshape(-1)) for _, d in rows], dtype=np.uint8).reshape(len(rows), (h * w + 7) // 8))
 
 
 class StoredDetections(Mapping):
