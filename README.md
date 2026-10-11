@@ -54,7 +54,7 @@ Windows it is a COM port, found by itself or given as `--rover COM4`):
 
 ```bash
 python -m xray.rover ping                     # the Arduino answers (optional: other firmware stays silent)
-python -m xray.rover test                     # each wheel forward then back
+python -m xray.rover test                     # each wheel forward then back; drive -130 130 1 must turn left
 python -m xray.rover drive 140 140 1          # straight ahead for 1 s (find the least power that moves it)
 python -m xray.live --scan-seconds 25 --ball --rover --rover-scan    # scans by itself; "drive" fetches the target
 ```
@@ -63,8 +63,9 @@ While tracking, `drive` (typed, or `POST /prompt`) drives to the target (the hid
 answer) and stops 12 cm short; `stop` stops. `--rover dry` logs the commands instead (any replay). `--rover-power
 TURN DRIVE MIN` sets the wheel power (default 130 140 100; the L298N drops ~2 V, so the motors see ~7 V: raise it if
 the wheels hum without moving). The phone need not face exactly forward: `--rover-scan` measures the mount's angle on
-its forward roll, or give it with `--rover-forward-offset DEG`. The Arduino stops the motors if the Jetson goes quiet
-for 0.3 s; the Jetson resends ten times a second while driving.
+its forward roll, or give it with `--rover-forward-offset DEG`. Left and right swapped (`drive -130 130 1` turns right): `SWAP_SIDES` in `xray/rover.py`
+(`--swap 0|1` to try); while driving, a turn that goes the wrong way swaps them by itself. The Arduino stops the motors if
+the Jetson goes quiet for 0.3 s; the Jetson resends ten times a second while driving.
 
 The stages: `xray.scan` (keyframes), `ground3d` (Qwen-3D INIT and `refine`: each object's digital twin),
 `xray.detect` (YOLOE), `xray.track` (3D tracking with object permanence), `xray.shell` (balls under cups),

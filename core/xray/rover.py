@@ -35,6 +35,7 @@ import numpy as np
 
 
 ARDUINO_VIDS = {0x2341, 0x2A03, 0x1A86, 0x0403, 0x10C4}      # Arduino, Arduino.org, CH340, FTDI, CP210x
+SWAP_SIDES = True       # this rover's firmware and wiring take "<right> <left>": "-130 130" turned it right, not left
 
 
 def find_port():
@@ -53,8 +54,9 @@ def find_port():
 class Rover:
     """The motors. port: a serial device, "auto" (find it) or "dry" (no hardware: log the commands)."""
 
-    def __init__(self, port="auto", log=print):
-        self.log, self.dry, self.ser = log, port == "dry", None
+    def __init__(self, port="auto", swap=SWAP_SIDES, log=print):
+        self.log, self.dry, self.ser, self.swap = log, port == "dry", None, swap
+        self.turn_sign, self.turn_yaw, self.turn_checked = 0, None, True
         self.cmd, self.cmd_t, self.lock, self.io, self.closed = (0, 0), 0.0, threading.Lock(), threading.Lock(), False
         self.sent_log = 0.0
         if not self.dry:
@@ -102,15 +104,37 @@ class Rover:
                     return True
             return False
 
-    def drive(self, left, right):
+    def line(self, left, right):
+        return f"{right} {left}" if self.swap else f"{left} {right}"
+
+    def drive(self, left, right, yaw=None):
         """Wheel speeds -255..255 (positive forward). Call it every frame while driving: if the calls stop for
-        0.5 s, the rover stops."""
+        0.5 s, the rover stops. yaw: the heading now (heading(T)), to check that turns go the commanded way."""
         left, right = int(np.clip(left, -255, 255)), int(np.clip(right, -255, 255))
+        if yaw is not None:
+            self.check_turn(left, right, yaw)
         with self.lock:
             changed = (left, right) != self.cmd
             self.cmd, self.cmd_t = (left, right), time.monotonic()
         if changed:
-            self._send(f"{left} {right}")
+            self._send(self.line(left, right))
+
+    def check_turn(self, left, right, yaw):
+        """On each turn in place, once the phone has turned 15 deg: if it turned the other way than commanded, the
+        left and right motors are swapped (wiring or firmware), so swap them here for the rest of the run."""
+        sign = (1 if right > left else -1) if left * right < 0 else 0      # +1: a left turn (counterclockwise)
+        if sign == 0:
+            return                                      # (pauses between turn pulses, driving ahead)
+        if sign != self.turn_sign:
+            self.turn_sign, self.turn_yaw, self.turn_checked = sign, yaw, False
+        elif not self.turn_checked:
+            moved = wrap(yaw - self.turn_yaw)
+            if abs(moved) > math.radians(15):
+                self.turn_checked = True
+                if moved * sign < 0:
+                    self.swap = not self.swap
+                    self.log("rover: a turn went the wrong way: left and right motors swapped, fixed in software "
+                             f"(SWAP_SIDES = {self.swap} in xray/rover.py makes it permanent)")
 
     def stop(self):
         with self.lock:
@@ -128,7 +152,7 @@ class Rover:
                 self.stop()
                 self.log("rover: no fresh command for 0.5 s, stopped")
             else:
-                self._send(f"{cmd[0]} {cmd[1]}")
+                self._send(self.line(*cmd))
 
     def close(self):
         if self.closed:
@@ -282,8 +306,10 @@ def main(argv=None):
     ap.add_argument("cmd", choices=("ping", "test", "drive"))
     ap.add_argument("args", nargs="*", type=float, help="drive: LEFT RIGHT SECONDS")
     ap.add_argument("--port", default="auto")
+    ap.add_argument("--swap", type=int, choices=(0, 1), default=int(SWAP_SIDES),
+                    help=f"send \"<right> <left>\" (1) or \"<left> <right>\" (0); default {int(SWAP_SIDES)}")
     args = ap.parse_args(argv)
-    rover = Rover(args.port)
+    rover = Rover(args.port, swap=bool(args.swap))
     try:
         if args.cmd == "ping":
             print("pong" if rover.ping() else "no answer")
