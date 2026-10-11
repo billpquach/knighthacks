@@ -38,7 +38,16 @@ asks Qwen-3D and, 3.5 s after its answer (say `stop` to cancel), hands over to t
 wherever it is moved meanwhile. `--qwen-stay --qwen-args "--bits 4"` loads YOLOE beside Qwen-3D right after the scan (`go` then starts
 tracking at once) and keeps a 4-bit Qwen-3D loaded through tracking, so descriptions work then too (answered about the scan: the rover goes to the object that stood there). 4-bit is ~1.2 GB
 smaller but untested on stage: compare its answers first (`python -m ground3d.ground <scan> -q "..." --bits 4`). It writes `states.jsonl` (and with `--video` the
-x-ray view) to `runs/live_<time>/`. To work from a recording instead of the phone:
+x-ray view) to `runs/live_<time>/`. For a demo, `--wait` loads everything first (Qwen-3D with `--ask`, and YOLOE where memory allows: without
+`--ask`, or with `--qwen-stay`), shows LOADING / READY on the camera view, and starts the scan only on Enter (or
+`POST /prompt scan`). Right after the scan Qwen-3D reads it (its vision encoder, ~20 s), so the first question is
+answered in seconds. Between judges: Ctrl+C, start it again, reset the props while it loads, Enter when READY:
+
+```bash
+python -m xray.live --wait --ask --ball --rover --rover-scan --video --out runs/judge1 2>&1 | tee -i judge1.log
+```
+
+To work from a recording instead of the phone:
 
 ```bash
 python -m xray.live --scan <rec>/scan --replay <rec>/track --ball          # the full live loop at recording speed

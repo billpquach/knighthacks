@@ -352,7 +352,8 @@ def refine_answers(scan, answers, points, out=None, log=print):
 
 
 def serve(g, jobs, parent, ram, args):
-    """Preloaded: answer jobs/job.json ({"scan", "queries" or "query", "frames", "more"}) into jobs/result.json. A job
+    """Preloaded: answer jobs/job.json ({"scan", "queries" or "query", "frames", "more"}) into jobs/result.json
+    ("queries": [] only encodes the scan, so the first question is quick). A job
     with "more": true keeps it loaded for the next one (on the same scan, encoded once: the ViT is unloaded after the
     first); otherwise, or as soon as jobs/stop appears, it exits so the memory is free for tracking."""
     (jobs / "ready").write_text(str(os.getpid()))
@@ -381,15 +382,17 @@ def serve(g, jobs, parent, ram, args):
             res.update(frames=len(sc.frames), voxels=sc.n_voxels, target_points=len(sc.target_xyz),
                        scene_s={k: round(v, 2) for k, v in sc.timing.items()})
             answers, points = [], []
-            for q in job.get("queries") or [job["query"]]:
+            queries = job.get("queries")
+            for q in (queries if queries is not None else [job["query"]]):
                 r, pts = g.query(q)
                 answers.append(r)
                 points.append(pts)
                 print(describe(r), flush=True)
                 if len(pts):                                # Qwen-3D's own cloud: drawn if the dense one fails
                     write_ply(jobs / f"{slug(q)}.ply", pts)
-            refine_answers(job["scan"], answers, points, out=jobs)
-            res.update(answers=answers, target=answers[0])
+            if answers:
+                refine_answers(job["scan"], answers, points, out=jobs)
+            res.update(answers=answers, target=answers[0] if answers else None)
         except Exception as e:                              # the live runner reads the error and falls back
             res["error"] = ("OUT OF MEMORY: " if is_oom(e) else "") + f"{type(e).__name__}: {str(e).splitlines()[0][:300]}"
             print(res["error"], flush=True)
