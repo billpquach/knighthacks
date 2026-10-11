@@ -60,7 +60,10 @@ python -m xray.live --scan-seconds 25 --ball --rover --rover-scan    # scans by 
 ```
 
 While tracking, `drive` (typed, or `POST /prompt`) drives to the target (the hidden ball's cup, or Qwen-3D's
-answer) and stops 12 cm short; `stop` stops. `--rover dry` logs the commands instead (any replay). `--rover-power
+answer); `drive to cup 2`, `drive to the yellow ball` (its cup, if it is under one), `touch 1` pick one by name; `stop`
+stops. It goes around the other cups and balls (via a point beside the target when the straight way is blocked), gently
+touches a cup with its front edge, and stops 3 cm short of a ball in the open. `--rover-size FRONT WIDTH` (metres, default
+0.11 0.15) is the phone-to-front-edge distance and the rover's width. `--rover dry` logs the commands instead (any replay). `--rover-power
 TURN DRIVE MIN` sets the wheel power (default 130 140 100; the L298N drops ~2 V, so the motors see ~7 V: raise it if
 the wheels hum without moving). The phone need not face exactly forward: `--rover-scan` measures the mount's angle on
 its forward roll, or give it with `--rover-forward-offset DEG`. Left and right swapped (`drive -130 130 1` turns right): `SWAP_SIDES` in `xray/rover.py`

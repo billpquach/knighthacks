@@ -59,6 +59,7 @@ import math
 import mimetypes
 import os
 import queue
+import re
 import shlex
 import socket
 import subprocess
@@ -290,23 +291,69 @@ def drive_target(tracker, game, track_id=None):
     return next((tr for tr in tracks if tr.id == want), None)
 
 
+def drive_command(text):
+    """A typed or posted line -> (True, the named target or None for "the target") for a drive command, else
+    (False, None). "drive", "drive to cup 2", "go to the yellow ball", "touch 1", "fetch the green ball"."""
+    t = text.lower().strip(" .!?")
+    if t in DRIVE_WORDS:
+        return True, None
+    m = DRIVE_VERBS.match(t)
+    if not m or (m.group(1) == "go" and not m.group(2)):            # ("go" alone ends the questions)
+        return False, None
+    rest = re.sub(r"^(the|a)\s+", "", m.group(3).strip())
+    return True, (None if rest in ("", "it", "target", "the target") else rest)
+
+
+def named_target(name, tracker, game):
+    """"cup 2" / "2" / "two" / "yellow ball" / "yellow" / "ball" -> (track, note) or (None, why not). A ball under a
+    cup is that cup."""
+    words = [str(NUMBERS.get(w, w)) for w in re.findall(r"[a-z]+|\d+", name)]
+    numbers = [int(w) for w in words if w.isdigit()]
+    if numbers:
+        tr = next((tr for tr in tracker.tracks if tr.id == numbers[0]), None)
+        return (tr, "") if tr is not None else (None, f"no cup {numbers[0]} (cups: "
+                                                      f"{', '.join(str(t.id) for t in tracker.tracks) or 'none'})")
+    balls = list(game.balls) if game is not None else []
+    colours = [w for w in words if w in BALL_BGR]
+    ball = next((b for b in balls if colours and b.colour == colours[0]), None) if colours else \
+        (balls[0] if "ball" in words and len(balls) == 1 else None)
+    if ball is None:
+        known = [f"cup {t.id}" for t in tracker.tracks] + [b.id for b in balls]
+        return None, f"don't know \"{name}\" (try: {', '.join(known) or 'nothing tracked yet'})"
+    if ball.inside is not None:
+        cup = next((tr for tr in tracker.tracks if tr.id == ball.inside), None)
+        return (cup, f"the {ball.id} is under cup {ball.inside}") if cup is not None else (None, f"cup {ball.inside} is gone")
+    return ball.track, ""
+
+
+def obstacles_besides(tracker, game, target_id):
+    """[(position, radius)] of everything tracked on the floor except the target (and balls inside cups)."""
+    out = [(tr.position, tr.radius) for tr in tracker.tracks if tr.id != target_id]
+    if game is not None:
+        out += [(b.track.position, b.track.radius) for b in game.balls if b.inside is None and b.track.id != target_id]
+    return out
+
+
 def drive_step(server, rover, nav, tracker, game, f, log=print):
     """One tracking frame of the rover: the prompts that start or stop it, then the wheel speeds toward the target
-    (its remembered position when unseen: the last stretch is out of the phone's view)."""
+    (its remembered position when unseen: the last stretch is out of the phone's view), around the other objects.
+    A cup is touched; a ball (it would roll away) is stopped just short of."""
     while True:
         try:
             text = server.prompts.get_nowait()
         except queue.Empty:
             break
-        word = text.lower().strip(" .!?")
-        if word in DRIVE_WORDS:
-            tr = drive_target(tracker, game)
+        is_drive, name = drive_command(text)
+        if is_drive:
+            tr, note = named_target(name, tracker, game) if name else (drive_target(tracker, game), "")
             if tr is None:
-                log("rover: no target to drive to yet")
+                log(f"rover: {note or 'no target to drive to yet'}")
             else:
-                nav.start(tr.id)
-                log(f"rover: driving to {tr.label} {tr.id}")
-        elif word in STOP_WORDS:
+                cup = any(t is tr for t in tracker.tracks)
+                nav.start(tr.id, touch=cup)
+                log(f"rover: {note + ': ' if note else ''}driving to {object_name(tr, game) if cup else tr.id}"
+                    + (" (to touch it)" if cup else ""))
+        elif text.lower().strip(" .!?") in STOP_WORDS:
             nav.stop()
             rover.stop()
             log("rover: stopped")
@@ -316,11 +363,14 @@ def drive_step(server, rover, nav, tracker, game, f, log=print):
     if tr is None:
         nav.stop("lost")
     else:
-        rover.drive(*nav.step(f.T, tr.position, tr.radius), yaw=rv.heading(f.T))
+        was = nav.approach
+        rover.drive(*nav.step(f.T, tr.position, tr.radius, obstacles_besides(tracker, game, tr.id)), yaw=rv.heading(f.T))
+        if nav.approach is not None and was is None:
+            log(f"rover: the way is blocked, going around via ({nav.approach[0]:+.2f}, {nav.approach[1]:+.2f})")
     if not nav.active:
         rover.stop()
-        log(f"rover: {nav.state}" + (f", {nav.info.get('distance_m', 0) * 100:.0f} cm from {nav.target_id}'s edge"
-                                     if nav.state == "arrived" else ""))
+        log(f"rover: {nav.state}" + (f", front edge {nav.info.get('gap_m', 0) * 100:+.0f} cm from {nav.target_id}'s edge"
+                                     if nav.state in ("arrived", "touched") else ""))
 
 
 SWEEP_S = 2.4                                           # an answer's confidence sweep, then the answer alone
@@ -721,6 +771,8 @@ def answer_points(folder, a, min_points=30):
 
 DRIVE_WORDS = {"drive", "fetch", "get it", "go get it", "go to it", "go to the target", "drive to the target"}
 STOP_WORDS = {"stop", "halt", "stop driving"}
+DRIVE_VERBS = re.compile(r"^(drive|fetch|get|find|touch|go)(?:\s+(?:over\s+)?(to|towards?|for))?\b\s*(.*)$")
+NUMBERS = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9}
 
 
 def read_console(server):
@@ -904,6 +956,8 @@ def main(argv=None):
     ap.add_argument("--rover-scan", action="store_true", help="the rover turns and rolls through the scan by itself")
     ap.add_argument("--rover-power", type=int, nargs=3, default=[130, 140, 100], metavar=("TURN", "DRIVE", "MIN"),
                     help="wheel power (of 255) to turn in place, to drive, and the least that moves the motors")
+    ap.add_argument("--rover-size", type=float, nargs=2, default=[0.11, 0.15], metavar=("FRONT", "WIDTH"),
+                    help="metres from the phone to the rover's front edge, and the rover's width (default 0.11 0.15)")
     ap.add_argument("--rover-forward-offset", type=float, metavar="DEG",
                     help="the rover's forward direction minus the phone's, in degrees (default: measured during "
                          "--rover-scan's forward roll, else 0)")
@@ -951,7 +1005,8 @@ def main(argv=None):
     if args.rover_scan and (not args.rover or args.scan):
         ap.error("--rover-scan needs --rover, and a scan made now (no --scan)")
     rover = rv.Rover(args.rover) if args.rover else None
-    nav = rv.Navigator(*args.rover_power, offset=math.radians(args.rover_forward_offset or 0.0))
+    nav = rv.Navigator(*args.rover_power, offset=math.radians(args.rover_forward_offset or 0.0),
+                       front=args.rover_size[0], width=args.rover_size[1])
     read_console(server)
     labels = detect.parse_prompt(args.prompt)
     qwen = Qwen(out / "qwen", shlex.split(args.qwen_args), args.qwen_python and str(Path(args.qwen_python).expanduser())) \
@@ -1172,9 +1227,9 @@ def main(argv=None):
             img = draw_view(cv2.cvtColor(f.rgb, cv2.COLOR_RGB2BGR), f, tracker, game, fps,
                             verdict if verdict and f.t - verdict_t < 5 else None)
             if rover is not None and nav.state not in ("idle",):
-                d = nav.info.get("distance_m")
+                d = nav.info.get("gap_m")
                 tag(img, f"ROVER: {nav.state} {'to ' + str(nav.target_id) if nav.target_id is not None else ''}"
-                    + (f", {d:.2f} m" if d is not None and nav.state in ("turning", "driving") else ""),
+                    + (f", {d:.2f} m" if d is not None and nav.state in ("turning", "driving", "detour") else ""),
                     (img.shape[1] // 2, img.shape[0] - 40), AMBER, 0.55)
             offer(out_q, (img, msg), newest=True)        # the stream never waits behind the files
             if phone is None:
