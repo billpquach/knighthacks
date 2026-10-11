@@ -442,6 +442,13 @@ def main(argv=None):
         for f in ("job.json", "result.json", "ready", "stop"):
             (jobs / f).unlink(missing_ok=True)
         (jobs / "pid").write_text(str(os.getpid()))
+        if args.parent:                                     # its runner gone (even mid-load): exit, freeing the memory
+            def watch():
+                while os.getppid() == args.parent:
+                    time.sleep(1)
+                print("the process that started this has ended: exiting to free the memory", flush=True)
+                os._exit(1)
+            threading.Thread(target=watch, daemon=True).start()
         print(f"torch {torch.__version__}, RAM in use {ram_idle:.2f} of {Ram.total():.2f} GB", flush=True)
         g = Grounder(args.upstream, args.weights, args.heads, args.processor, args.device,
                      vit8=not args.no_vit8, emb8=not args.no_emb8, bits=args.bits)
