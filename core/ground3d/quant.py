@@ -4,6 +4,10 @@ A Linear keeps its weight as int8 with one bf16 scale per output row (symmetric 
 bf16 only for its own matmul, so the full bf16 model (~7 GB) never exists at once. The token-embedding
 table is int8 per row too, and only the rows looked up get expanded.
 
+With bits=4 the language model's Linears are 4-bit instead (two weights per byte, a bf16 scale and minimum per
+64 weights of a row; about 1.2 GB less): for keeping Qwen-3D loaded beside the tracker. Its answers can differ from 8-bit's:
+check them on a saved scan before relying on it.
+
 load_streaming() builds the model with empty weights, then reads the safetensors one tensor at a time,
 quantizing on the way in, and drops each file from the page cache once read: on the Jetson the page cache
 and the GPU share the same RAM, and 7 GB of cached weights would crowd out the model itself.
@@ -56,6 +60,45 @@ class Int8Linear(nn.Module):
         return F.linear(x.to(w.dtype), w, None if self.bias is None else self.bias.to(w.dtype))
 
 
+@torch.no_grad()
+def quantize_groups4(w, device, group=64, rows=2048):
+    """w [out, in] -> (uint8 [out, in / 2]: two 4-bit codes per byte, bf16 scale and bf16 minimum [out, in / group]):
+    each group of `group` weights along a row spans its own min..max in 16 steps (asymmetric: a lopsided group
+    loses less than with a scale from its largest magnitude), a few thousand rows at a time."""
+    out, n = w.shape
+    if n % group:
+        raise ValueError(f"4-bit needs in_features divisible by {group}, got {n}")
+    packed = torch.empty(out, n // 2, dtype=torch.uint8, device=device)
+    scale = torch.empty(out, n // group, dtype=torch.bfloat16, device=device)
+    low = torch.empty(out, n // group, dtype=torch.bfloat16, device=device)
+    for i in range(0, out, rows):
+        part = w[i:i + rows].to(device).float().view(-1, n // group, group)
+        lo = part.amin(dim=2, keepdim=True)
+        s = (part.amax(dim=2, keepdim=True) - lo).clamp_(min=1e-8) / 15
+        q = torch.round((part - lo) / s).clamp_(0, 15).to(torch.uint8).view(-1, n)
+        packed[i:i + rows] = q[:, 0::2] | (q[:, 1::2] << 4)
+        scale[i:i + rows], low[i:i + rows] = s.squeeze(2).to(torch.bfloat16), lo.squeeze(2).to(torch.bfloat16)
+    return packed, scale, low
+
+
+class Int4Linear(Int8Linear):
+    """Int8Linear's layout with 4-bit weights (quantize_groups4), expanded to bf16 only for its own matmul."""
+    GROUP = 64
+
+    def __init__(self, in_features, out_features, bias):
+        super().__init__(in_features, out_features, bias)
+        self.register_buffer("low", None)
+
+    @torch.no_grad()
+    def set_weight(self, w, device):
+        self.q, self.scale, self.low = quantize_groups4(w, device, self.GROUP)
+
+    def weight_bf16(self):
+        p, out = self.q, self.q.shape[0]
+        q = torch.stack((p & 15, p >> 4), dim=-1).view(out, -1, self.GROUP).to(torch.bfloat16)
+        return (q * self.scale.unsqueeze(-1) + self.low.unsqueeze(-1)).view(out, -1)
+
+
 class Int8Embedding(nn.Module):
     def __init__(self, num_embeddings, embedding_dim):
         super().__init__()
@@ -83,11 +126,12 @@ def chunked_mlp(mlp, chunk=1024):
     mlp.forward = types.MethodType(forward, mlp)
 
 
-def _swap_linears(module, names):
+def _swap_linears(module, names, cls=None):
+    cls = cls or Int8Linear
     for name in names:
         lin = getattr(module, name, None)
         if isinstance(lin, nn.Linear):
-            setattr(module, name, Int8Linear(lin.in_features, lin.out_features, lin.bias is not None))
+            setattr(module, name, cls(lin.in_features, lin.out_features, lin.bias is not None))
 
 
 def _drop_page_cache(path):
@@ -99,8 +143,8 @@ def _drop_page_cache(path):
         pass
 
 
-def load_streaming(model_cls, config, weights_dir, device="cuda", vit8=True, emb8=True, log=print):
-    """model_cls(config) with int8 decoder Linears (and ViT Linears with vit8, embeddings with emb8),
+def load_streaming(model_cls, config, weights_dir, device="cuda", vit8=True, emb8=True, bits=8, log=print):
+    """model_cls(config) with int8 decoder Linears (4-bit with bits=4; ViT Linears int8 with vit8, embeddings with emb8),
     weights read from weights_dir/*.safetensors one tensor at a time. lm_head is dropped: Qwen-3D reads
     hidden states, not logits."""
     from accelerate import init_empty_weights
@@ -111,9 +155,10 @@ def load_streaming(model_cls, config, weights_dir, device="cuda", vit8=True, emb
     with init_empty_weights(include_buffers=False):
         model = model_cls._from_config(config, attn_implementation="sdpa", torch_dtype=torch.bfloat16)
     model.lm_head = nn.Identity()
+    decoder = Int4Linear if bits == 4 else Int8Linear
     for layer in model.model.layers:
-        _swap_linears(layer.self_attn, ("q_proj", "k_proj", "v_proj", "o_proj"))
-        _swap_linears(layer.mlp, ("gate_proj", "up_proj", "down_proj"))
+        _swap_linears(layer.self_attn, ("q_proj", "k_proj", "v_proj", "o_proj"), decoder)
+        _swap_linears(layer.mlp, ("gate_proj", "up_proj", "down_proj"), decoder)
         chunked_mlp(layer.mlp)
     if vit8:
         for blk in model.visual.blocks:

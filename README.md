@@ -33,7 +33,11 @@ from one side only are completed by symmetry (`ground3d.refine.complete_round`),
 It serves `/state`, `/state.json`, `/frame.jpg`, `/scene` and `/metrics` on port 8080 (the same endpoints as
 `replay_server.py`), plus the viewer at `/` once it is built. With `--ask`, Qwen-3D loads while the phone scans;
 questions are typed in the console or sent with `curl -X POST <jetson>:8080/prompt -d 'the cup next to the ball'`,
-and `go` hands over to YOLOE tracking (Qwen-3D exits first, so its memory is free). It writes `states.jsonl` (and with `--video` the
+and `go` hands over to YOLOE tracking (Qwen-3D exits first, so its memory is free). With `--rover`, `drive to the cup next to the green ball`
+asks Qwen-3D and, 3.5 s after its answer (say `stop` to cancel), hands over to tracking and drives to that object,
+wherever it is moved meanwhile. `--qwen-stay --qwen-args "--bits 4"` keeps a 4-bit Qwen-3D loaded through tracking, so
+descriptions work then too (answered about the scan: the rover goes to the object that stood there). 4-bit is ~1.2 GB
+smaller but untested on stage: compare its answers first (`python -m ground3d.ground <scan> -q "..." --bits 4`). It writes `states.jsonl` (and with `--video` the
 x-ray view) to `runs/live_<time>/`. To work from a recording instead of the phone:
 
 ```bash

@@ -335,7 +335,44 @@ def obstacles_besides(tracker, game, target_id):
     return out
 
 
-def drive_step(server, rover, nav, tracker, game, f, log=print):
+class LateQwen:
+    """--qwen-stay: Qwen-3D kept loaded through tracking, asked in the background. Its answers are about the scan
+    (where things stood then); answer() turns one into the tracked object that stood there, wherever it is now."""
+
+    def __init__(self, qwen, scan):
+        self.qwen, self.scan, self.answers, self.busy = qwen, scan, queue.Queue(), None
+
+    def ask(self, text):
+        if self.busy:
+            return False
+        self.busy = text
+
+        def run():
+            try:
+                res = self.qwen.ask(self.scan, text)
+            except Exception as e:
+                res = {"error": str(e)}
+            self.answers.put((text, res))
+            self.busy = None
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
+    @staticmethod
+    def answer(res, tracker, game):
+        """(track, note) for Qwen-3D's answer, or (None, why)."""
+        a = (res.get("answers") or [{}])[0]
+        point = (a.get("refined") or {}).get("center") or a.get("center")
+        if res.get("error") or point is None:
+            return None, res.get("error") or "nothing found"
+        tracks = list(tracker.tracks) + ([b.track for b in game.balls if b.inside is None] if game is not None else [])
+        point = np.asarray(point, float)
+        near = min(tracks, key=lambda tr: float(np.linalg.norm(tr.origin[:2] - point[:2])), default=None)
+        if near is None or np.linalg.norm(near.origin[:2] - point[:2]) > 0.15:
+            return None, f"no tracked object where it pointed ({tk.r4(point)})"
+        return near, f"score {a.get('score', 0):.2f}, {a.get('seconds', 0):.1f} s"
+
+
+def drive_step(server, rover, nav, tracker, game, f, log=print, late=None):
     """One tracking frame of the rover: the prompts that start or stop it, then the wheel speeds toward the target
     (its remembered position when unseen: the last stretch is out of the phone's view), around the other objects.
     A cup is touched; a ball (it would roll away) is stopped just short of."""
@@ -347,7 +384,12 @@ def drive_step(server, rover, nav, tracker, game, f, log=print):
         is_drive, name = drive_command(text)
         if is_drive:
             tr, note = named_target(name, tracker, game) if name else (drive_target(tracker, game), "")
-            if tr is None:
+            if tr is None and late is not None and name and not re.search(r"\d", name):
+                if late.ask(name):                      # a description: Qwen-3D, still loaded (--qwen-stay)
+                    log(f"rover: asking Qwen-3D for '{name}'")
+                else:
+                    log(f"rover: Qwen-3D is still on '{late.busy}'")
+            elif tr is None:
                 log(f"rover: {note or 'no target to drive to yet'}")
             else:
                 cup = any(t is tr for t in tracker.tracks)
@@ -358,6 +400,18 @@ def drive_step(server, rover, nav, tracker, game, f, log=print):
             nav.stop()
             rover.stop()
             log("rover: stopped")
+    while late is not None:                             # Qwen-3D's answers, as they come
+        try:
+            text, res = late.answers.get_nowait()
+        except queue.Empty:
+            break
+        tr, note = late.answer(res, tracker, game)
+        if tr is None:
+            log(f"rover: Qwen-3D on '{text}': {note}")
+        else:
+            cup = any(t is tr for t in tracker.tracks)
+            nav.start(tr.id, touch=cup)
+            log(f"rover: Qwen-3D: '{text}' -> {object_name(tr, game) if cup else tr.id} ({note}); driving to it")
     if not nav.active:
         return
     tr = drive_target(tracker, game, nav.target_id)
@@ -608,13 +662,14 @@ class StillPicker:
     sharp one of that stop."""
 
     def __init__(self, picker, routine):
-        self.picker, self.routine, self.taken = picker, routine, None
+        self.picker, self.routine = picker, routine
+        routine.wants_views = True                      # (each stop lasts until its view, up to PAUSE_MAX)
 
     def offer(self, f):
         stop = self.routine.paused_from
-        if not self.routine.still or stop == self.taken or not self.picker.offer(f):
+        if not self.routine.still or stop == self.routine.viewed or not self.picker.offer(f):
             return False
-        self.taken = stop
+        self.routine.viewed = stop
         return True
 
     def __getattr__(self, name):
@@ -821,24 +876,34 @@ def read_console(server):
         threading.Thread(target=typed, daemon=True).start()
 
 
+DRIVE_DELAY = 3.5                                       # s from Qwen-3D's answer to driving (say "stop" to cancel)
+CANCEL_WORDS = {"stop", "no", "cancel", "wait", "don't"}
+
+
 def ask_phase(qwen, scan, server, frames, log=print):
     """Questions for Qwen-3D until "go": from POST /prompt (the dashboard, voice) or typed in the console. Meanwhile
     the camera view shows every answer's cloud (the newest one as the target), and the state stream lists the answers
-    as objects, each with its cloud. Returns the answers ([dict(query, score, band, seconds, point, points, ...)])."""
-    answers, asked, busy = [], queue.Queue(), [None]
+    as objects, each with its cloud. "drive to <a description>" asks Qwen-3D too, and DRIVE_DELAY s after its answer
+    (unless "stop") tracking starts with that answer as the target and the rover drives to it.
+    Returns (the answers [dict(query, score, band, seconds, point, points, ...)], the index of the one to drive to
+    or None)."""
+    answers, asked, busy, pending = [], queue.Queue(), [None], [None]
+    requests = dict(sent=0, cancelled=0)               # drive requests: a "stop" cancels those still being answered
 
     def work():                                         # one question at a time, beside the camera view
         while True:
-            text = asked.get()
-            if text is None:
+            job = asked.get()
+            if job is None:
                 return
+            text, seq = job                             # seq: the drive request's number (0: a question)
+            wants_drive = seq > requests["cancelled"]
             while not qwen.ready() and qwen.alive():
                 time.sleep(0.2)
             busy[0] = text
             res = qwen.ask(scan, text)
             a = (res.get("answers") or [{}])[0]
             if res.get("error") or not a.get("center"):
-                log(f"Qwen-3D: '{text}': {res.get('error') or 'nothing found'}")
+                log(f"Qwen-3D: '{text}': {res.get('error') or 'nothing found'}" + ("; not driving" if wants_drive else ""))
             else:
                 ref = a.get("refined") or {}
                 pts, which = answer_points(qwen.folder, a)
@@ -848,6 +913,8 @@ def ask_phase(qwen, scan, server, frames, log=print):
                                     ram_gb=res.get("ram_gb"), arrived=time.monotonic(),
                                     candidates=[dict(c, points=np.asarray(c["points"], float)) for c in a.get("candidates") or []],
                                     heat=np.asarray(a.get("heat") or np.zeros((0, 4)), float).reshape(-1, 4)))
+                if seq > requests["cancelled"]:             # (not cancelled meanwhile) the countdown to the handoff
+                    pending[0] = (len(answers) - 1, time.monotonic() + DRIVE_DELAY)
                 why = ref.get("error") or f"{ref.get('n_points', 0)} points near the answer"
                 weighed = ", ".join(f"{c['score']:.2f}" for c in a.get("candidates") or [])
                 log(f"Qwen-3D: '{text}' -> score {a['score']:.2f} ({a['band']}) at {tk.r4(point)}, {a['seconds']:.1f} s; "
@@ -856,10 +923,16 @@ def ask_phase(qwen, scan, server, frames, log=print):
                     + (f"; also weighed {weighed}" if weighed else ""))
             busy[0] = None
 
+    def countdown(img):
+        if pending[0] is not None:
+            a, left = answers[pending[0][0]], max(0.0, pending[0][1] - time.monotonic())
+            tag(img, f"DRIVING TO '{a['query']}' IN {left:.1f} s  (say stop to cancel)",
+                (img.shape[1] // 2, img.shape[0] - 120), AMBER, 0.5)
     worker = threading.Thread(target=work, daemon=True)
     worker.start()
-    log('ASK: type a question (or POST /prompt {"text": ...}); "go" starts tracking')
-    go, last, said, shown = False, None, None, 0.0
+    log('ASK: type a question (or POST /prompt {"text": ...}); "go" starts tracking; '
+        '"drive to <description>" asks, then hands over and drives')
+    go, last, said, shown, drive = False, None, None, 0.0, None
     for f in frames:
         if said is None and qwen.ready():               # the console says so too, with the load time and memory
             said = True
@@ -873,10 +946,31 @@ def ask_phase(qwen, scan, server, frames, log=print):
                 text = server.prompts.get_nowait()
             except queue.Empty:
                 break
-            if text.lower().strip(" .!") in ("go", "start", "track"):
+            word = text.lower().strip(" .!?")
+            is_drive, name = drive_command(text)
+            if word in ("go", "start", "track"):
                 go = True
+            elif word in CANCEL_WORDS:
+                if pending[0] is not None or requests["sent"] > requests["cancelled"]:
+                    pending[0], requests["cancelled"] = None, requests["sent"]
+                    log("drive cancelled: ask again, or say go")
+            elif is_drive and name is None:             # "drive": to the newest answer
+                if answers:
+                    pending[0] = (len(answers) - 1, time.monotonic() + DRIVE_DELAY)
+                else:
+                    log("nothing to drive to yet: say what, e.g. 'drive to the cup next to the green ball'")
+            elif is_drive and re.search(r"\d", name):
+                log(f"'{name}': cup numbers come with tracking. Describe it (e.g. 'drive to the cup on the left'), "
+                    "or say go, then 'drive to cup N'")
+            elif is_drive:
+                log(f"Qwen-3D: finding '{name}' to drive to")
+                requests["sent"] += 1
+                asked.put((name, requests["sent"]))
             else:
-                asked.put(text)
+                asked.put((text, 0))
+        if pending[0] is not None and time.monotonic() >= pending[0][1]:
+            drive, go = pending[0][0], True             # the handoff: Qwen-3D's answer becomes the target
+            log(f"driving to Qwen-3D's answer to '{answers[drive]['query']}'")
         if go:
             if last is not None:                        # the view says what happens next while YOLOE loads
                 img, msg = last
@@ -925,6 +1019,7 @@ def ask_phase(qwen, scan, server, frames, log=print):
         tag(img, status, (img.shape[1] // 2, 22), AMBER, 0.5)
         if answers:
             decision_card(img, answers[-1])
+        countdown(img)
         sweep = None
         if answers and time.monotonic() - answers[-1]["arrived"] < SWEEP_S and len(answers[-1]["heat"]):
             a = answers[-1]
@@ -933,13 +1028,14 @@ def ask_phase(qwen, scan, server, frames, log=print):
         msg = dict(t=round(float(f.t), 3), frame=int(f.index), phase="ask", target_id=None,
                    camera=camera_block(f.T), objects=objects,
                    qwen=dict(status=status, ready=qwen.ready(), thinking=busy[0], sweep=sweep,
+                             driving_in=None if pending[0] is None else round(max(0.0, pending[0][1] - time.monotonic()), 1),
                              answers=[{k: a.get(k) for k in ("query", "target", "score", "band", "seconds", "point", "top5",
                                                              "llm_seconds", "tokens", "gpu_peak_gb", "ram_gb")} for a in answers]))
         server.publish(img, msg)
         last = img, msg
     asked.put(None)
     worker.join(timeout=300)                            # a question still being answered finishes first
-    return answers
+    return answers, drive
 
 
 def live_cloud(f, n=1500, max_depth=3.0):
@@ -1011,6 +1107,10 @@ def main(argv=None):
                     "'go' to track (the last answer is the target)")
     ap.add_argument("--qwen-args", default="", help="extra arguments for the Qwen-3D server, e.g. \"--models ~/models/qwen3d\"")
     ap.add_argument("--qwen-python", help="the Python (venv) with torch and transformers for Qwen-3D (default: this one)")
+    ap.add_argument("--qwen-stay", action="store_true",
+                    help="with --ask: keep Qwen-3D loaded through tracking, so 'drive to <description>' works then too "
+                         "(it needs --qwen-args \"--bits 4\" to fit beside YOLOE on the 8 GB Jetson; its answers are about "
+                         "the scan, and go to the object that stood there, wherever it is now)")
     ap.add_argument("--results", help="target = Qwen-3D's first answer (a python -m ground3d.ground --out folder)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
@@ -1078,7 +1178,7 @@ def main(argv=None):
             if to_world is not None:
                 f.T = to_world @ f.T
             yield f
-    answers = []
+    answers, drive_answer = [], None
     if qwen is not None:                                # understand, then free the memory for YOLOE
         def scan_scene():                               # the scan's cloud for the viewer while questions are asked
             try:                                        # (no objects yet: tracking replaces it with the twins)
@@ -1089,14 +1189,15 @@ def main(argv=None):
                 print(f"(no /scene while asking: {e})", flush=True)
         threading.Thread(target=scan_scene, daemon=True).start()
         try:
-            answers = ask_phase(qwen, scan, server, in_world(frames_from(source, args.start, args.speed)))
+            answers, drive_answer = ask_phase(qwen, scan, server, in_world(frames_from(source, args.start, args.speed)))
         except KeyboardInterrupt:
             answers = None
         except RuntimeError as e:                       # the phone stopped
             print(f"stopped: {e}. {PHONE_TIP}", flush=True)
             answers = None
         finally:
-            qwen.stop()
+            if not args.qwen_stay or answers is None:
+                qwen.stop()
         if answers is None:                             # Ctrl+C before "go"
             if rover is not None:
                 rover.close()
@@ -1106,7 +1207,8 @@ def main(argv=None):
             if phone is not None:
                 os._exit(0)
             return 0
-        print(f"Qwen-3D done: {len(answers)} answers; its memory is free; loading YOLOE", flush=True)
+        print(f"Qwen-3D done: {len(answers)} answers; " + ("it stays loaded (--qwen-stay)" if args.qwen_stay else
+              "its memory is free") + "; loading YOLOE", flush=True)
     cached = detect.load_detections(detect.cache_path(args.replay, labels)) if args.replay else None
     scan_cached = detect.load_detections(detect.cache_path(scan, labels)) is not None
     detector = None if cached is not None and scan_cached else detect.Detector(labels)
@@ -1115,7 +1217,8 @@ def main(argv=None):
     objects, table = tk.scan_objects(scan, args.prompt, use_detector=False)
     print(f"scene: {len(objects)} objects, table at {table if table is None else round(table, 3)} m: "
           + ", ".join(f"{o['label']} at {tk.r4(o['position'])}" for o in objects), flush=True)
-    pick = ([a for a in answers if a.get("band") == "high"] or answers)[-1:]   # the last confident answer
+    pick = [answers[drive_answer]] if drive_answer is not None else \
+        ([a for a in answers if a.get("band") == "high"] or answers)[-1:]   # the one to drive to, or the last confident
     point, query = (pick[0]["point"], pick[0]["query"]) if pick else \
         qwen_target(args.results) if args.results else (None, None)
 
@@ -1140,6 +1243,13 @@ def main(argv=None):
             print(f"target: '{query}' -> {picked}", flush=True)
         return tracker, game
     tracker, game = new_game()
+    late = LateQwen(qwen, scan) if args.qwen_stay and qwen is not None and qwen.alive() else None
+    if rover is not None and drive_answer is not None:  # "drive to <description>": Qwen-3D picked it, now go there
+        tr = drive_target(tracker, game)
+        if tr is not None:
+            cup = any(t is tr for t in tracker.tracks)
+            nav.start(tr.id, touch=cup)
+            print(f"rover: driving to {object_name(tr, game) if cup else tr.id}, Qwen-3D's answer", flush=True)
     def make_scene():                                   # beside the tracking: it takes seconds, and /scene can wait
         try:
             info = {}
@@ -1249,7 +1359,7 @@ def main(argv=None):
             msg = tracker.message(f, fps)
             msg["heal_version"] = server.healer.version if server.healer is not None else 0
             if rover is not None:                       # "drive" / "stop" (POST /prompt or typed), then steer
-                drive_step(server, rover, nav, tracker, game, f)
+                drive_step(server, rover, nav, tracker, game, f, late=late)
                 msg["drive"] = nav.status()
             if game is not None:
                 msg = game.message(msg)
@@ -1264,6 +1374,8 @@ def main(argv=None):
                 msg["scene"] = dict(floor_z=floor, point_cloud=dict(frame="world", points=live_cloud(f, args.live_cloud)))
             img = draw_view(cv2.cvtColor(f.rgb, cv2.COLOR_RGB2BGR), f, tracker, game, fps,
                             verdict if verdict and f.t - verdict_t < 5 else None)
+            if late is not None and late.busy:
+                tag(img, f"Qwen-3D thinking: '{late.busy}'", (img.shape[1] // 2, 22), AMBER, 0.5)
             if rover is not None and nav.state not in ("idle",):
                 d = nav.info.get("gap_m")
                 tag(img, f"ROVER: {nav.state} {'to ' + str(nav.target_id) if nav.target_id is not None else ''}"
@@ -1284,6 +1396,8 @@ def main(argv=None):
     finally:                                            # every step guarded: the files must close, the process exit
         if rover is not None:
             rover.close()                               # first: the motors stop
+        if late is not None:
+            late.qwen.stop()
         for q, th in ((out_q, threads[1]), (files_q, threads[2])):
             try:
                 q.put(None, timeout=5)
