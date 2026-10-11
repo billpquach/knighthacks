@@ -9,7 +9,8 @@ Team:
 ## Robot viewer
 
 The live visualization and camera interface is in [viewer/](viewer/README.md).
-Build it with `npm ci && npm run build` from that folder, then run
+The built viewer is committed in `viewer/dist/`, so `git pull` brings the current one; after changing
+`viewer/src/`, rebuild with `npm ci && npm run build` from that folder and commit `viewer/dist/` too. Then run
 `python replay_server.py` from the repository root and open
 `http://localhost:8080`. Install `requirements-replay.txt` first if needed.
 The local server supplies an explicitly labeled simulation until a Jetson URL
