@@ -196,6 +196,48 @@ def with_minimum(v, minimum):
     return 0 if v == 0 else int(math.copysign(max(abs(v), minimum), v))
 
 
+class Speedometer:
+    """How fast the phone has been moving over the floor (m/s) over the last `window` s."""
+
+    def __init__(self, window=0.3):
+        self.window, self.history = window, []
+
+    def __call__(self, pos, now):
+        self.history = [(p, t) for p, t in self.history if now - t <= self.window] + [(np.asarray(pos)[:2].copy(), now)]
+        (p0, t0), (p1, t1) = self.history[0], self.history[-1]
+        return float(np.linalg.norm(p1 - p0)) / (t1 - t0) if t1 > t0 else 0.0
+
+
+class Pace:
+    """Wheel power for a steady, slow pace (a turn rate in rad/s, or m/s ahead), from what the phone measures. A DC
+    motor needs more power to start than to keep going, and below that it only hums. So it remembers two powers:
+    `start`, what last got it going (a little less is tried each time; while it only hums, more every moment), and
+    `run`, the least that keeps it at the target pace once going (adjusted while going; raised if it stalls). Call
+    idle() while standing still, so the next move starts from rest."""
+
+    def __init__(self, target, power, low, high=210, gain=80.0):
+        self.target, self.low, self.high, self.gain = target, low, high, gain
+        self.start = self.run = float(power)
+        self.going, self.t = False, None
+
+    def __call__(self, measured, now):
+        dt = 0.0 if self.t is None else min(0.2, now - self.t)
+        self.t = now
+        if abs(measured) < 0.4 * self.target:           # not going: the starting power, more each moment it hums
+            if self.going:                              # (it was going and stalled: running power too low)
+                self.going, self.run = False, min(self.high, self.run + 5)
+            self.start = min(self.high, self.start + self.gain * dt)
+            return self.start
+        if not self.going:                              # it started: next time try a little less to start it
+            self.going, self.start = True, max(self.low, self.start - 3)
+        err = float(np.clip((self.target - abs(measured)) / self.target, -1.0, 1.0))
+        self.run = float(np.clip(self.run + 0.5 * self.gain * err * dt, self.low, self.high))
+        return self.run
+
+    def idle(self):
+        self.going, self.t = False, None
+
+
 class Navigator:
     """Wheel speeds to reach a target on the floor, from the phone's pose. step() each frame.
 
@@ -216,10 +258,15 @@ class Navigator:
     CLEAR = 0.025                       # kept between the rover's body and an obstacle's edge
     AT_POINT = 0.03                     # an approach point counts as reached this close
     TIMEOUT = 30.0                      # s
-    MAX_RATE = math.radians(90)         # a safety net (the turn power sets the speed): faster loses the tracking
+    MAX_RATE = math.radians(90)         # a safety net: faster blurs the view and can lose the phone's tracking
+    TURN_RATE = math.radians(25)        # the pace of a turn in place
+    SPEED = 0.12                        # m/s driving
+    CREEP = 0.05                        # m/s touching
 
     def __init__(self, turn=115, speed=120, minimum=100, steer=1.2, offset=0.0, front=0.11, width=0.15):
-        self.turn, self.speed, self.minimum, self.steer = turn, speed, minimum, steer
+        self.turn, self.speed, self.minimum, self.steer = turn, speed, minimum, steer   # (starting powers)
+        self.turn_pace, self.drive_pace = Pace(self.TURN_RATE, turn, minimum), Pace(self.SPEED, speed, minimum)
+        self.creep_pace, self.spin, self.speedo, self.mode = None, TurnRate(0.25), Speedometer(), None
         self.offset = offset                            # the rover's forward direction minus the phone's (radians)
         self.front, self.half_width = front, width / 2  # the front edge ahead of the phone; half the rover's width
         self.active, self.state, self.target_id, self.t0, self.info = False, "idle", None, 0.0, {}
@@ -229,9 +276,18 @@ class Navigator:
     def start(self, target_id, touch=False):
         self.active, self.state, self.target_id, self.t0 = True, "turning", target_id, time.monotonic()
         self.touch, self.planned, self.approach, self.creep = touch, False, None, None
+        self.moving("still")
+
+    def moving(self, mode):
+        """Switching between still, turning and driving: the pace not in use starts from rest next time."""
+        if mode != self.mode:
+            self.turn_pace.idle()
+            self.drive_pace.idle()
+            self.mode = mode
 
     def stop(self, state="stopped"):
         self.active, self.state = False, state
+        self.moving("still")
 
     def room(self, a, b, obstacles):
         """The least room (m) between the rover's body, its front edge going straight from a to b, and an obstacle
@@ -285,6 +341,7 @@ class Navigator:
         target = np.asarray(target, float)[:2]
         yaw = heading(T) + self.offset                  # the rover's forward direction
         rate = self.rate(heading(T), now)
+        spin, speed = self.spin(heading(T), now), self.speedo(pos, now)
         d = float(np.linalg.norm(target - pos)) - radius
         gap = d - self.front                            # from the rover's front edge to the target's edge
         err = wrap(math.atan2(target[1] - pos[1], target[0] - pos[0]) - yaw)
@@ -297,13 +354,14 @@ class Navigator:
             if gap <= -self.PUSH or now - start_t > self.CREEP_S:
                 self.stop("touched")
                 return 0, 0
-            if now - last_t > 0.6:                      # still pushing but not moving: it's touching something
-                if np.linalg.norm(pos - last_pos) < 0.004:
+            if now - last_t > 0.6:                      # pushing as hard as it may but not moving: touching it
+                if np.linalg.norm(pos - last_pos) < 0.004 and self.creep_pace.start >= self.creep_pace.high - 1:
                     self.stop("touched")
                     return 0, 0
                 self.creep = (start_t, pos.copy(), now)
-            k = float(np.clip(self.steer * err, -0.3, 0.3)) * self.minimum
-            return with_minimum(self.minimum - k, self.minimum), with_minimum(self.minimum + k, self.minimum)
+            v = self.creep_pace(speed, now)             # (never harder than what got it rolling before, + 10)
+            k = float(np.clip(self.steer * err, -0.3, 0.3)) * v
+            return with_minimum(v - k, self.minimum), with_minimum(v + k, self.minimum)
         if not self.planned:
             self.approach, self.planned = self.plan(pos, target, radius, list(obstacles)), True
         if self.approach is not None and np.linalg.norm(self.approach - pos) < self.AT_POINT:
@@ -314,7 +372,11 @@ class Navigator:
                 return 0, 0
             if self.touch and gap <= self.APPROACH and abs(err) < self.ALIGN:
                 self.state, self.creep = "touching", (now, pos.copy(), now + 0.4)    # (a moment to get going)
-                return 0, 0
+                cap = max(self.minimum, self.drive_pace.start) + 15     # (never pushes harder than that)
+                self.creep_pace = Pace(self.CREEP, min(cap, self.drive_pace.run), self.minimum, high=cap)
+                self.creep_pace.start, self.creep_pace.going = cap - 15, self.drive_pace.going
+                self.moving("still")
+                return self.step(T, target, radius, obstacles)      # (straight on: no stop in between)
             moving = "driving"
             if gap <= self.APPROACH:                    # close: only straight ahead (never sideways into it)
                 realign = self.ALIGN
@@ -327,12 +389,14 @@ class Navigator:
         if self.state in ("driving", "detour") and abs(err) > realign or \
                 self.state not in ("driving", "detour") and abs(err) > self.ALIGN:
             self.state = "turning"                      # err > 0: the target is to the left: turn left
-            if abs(rate) > self.MAX_RATE:               # too fast: coast this frame (the motors can't go slower)
+            self.moving("turning")
+            if abs(rate) > self.MAX_RATE:               # (a safety net)
                 return 0, 0
-            s = self.turn if err > 0 else -self.turn
-            return with_minimum(-s, self.minimum), with_minimum(s, self.minimum)
+            p = int(round(self.turn_pace(spin, now)))   # a steady, slow turn (more to start it, see Pace)
+            return (-p, p) if err > 0 else (p, -p)
         self.state = moving
-        v = self.speed                                  # one steady, slow speed (no slowing down: no lurches)
+        self.moving("driving")
+        v = self.drive_pace(speed, now)                 # one steady, slow speed (no slowing down: no lurches)
         k = float(np.clip(self.steer * err, -0.6, 0.6)) * v
         return with_minimum(v - k, self.minimum), with_minimum(v + k, self.minimum)
 
@@ -344,9 +408,10 @@ class Navigator:
 
 class ScanRoutine:
     """The rover's own scan, stop and shoot: turn in 20 deg steps to 40 deg left, across to 40 deg right and back to
-    where it started, roll forward 15 cm, and the same again (headings relative to the start). After each move it
-    stands still for PAUSE, and the scan takes its views only then (`still`), once the phone has stopped wobbling on
-    its mast: every view sharp, none smeared by a turn. step() each frame until done."""
+    where it started, roll forward 15 cm, and the same again (headings relative to the start), at a slow, steady
+    pace (Pace: a push to get going, then the least that keeps it turning). After each move it stands still for
+    PAUSE, and the scan takes its views only then (`still`), once the phone has stopped wobbling on its mast: every
+    view sharp, none smeared by a turn. step() each frame until done."""
     SWEEP = (("turn", 20), ("turn", 40), ("turn", 20), ("turn", 0),
              ("turn", -20), ("turn", -40), ("turn", -20), ("turn", 0))
     STEPS = SWEEP + (("forward", 0.15),) + SWEEP
@@ -354,13 +419,16 @@ class ScanRoutine:
     PAUSE = 1.0                         # s standing still after each move
     SETTLE = 0.4                        # s into a pause before views count (the mast stops swaying)
     STEP_TIMEOUT = 10.0                 # s for one move (then the next)
-    MAX_RATE = math.radians(60)         # a safety net (the turn power sets the speed)
+    MAX_RATE = math.radians(60)         # a safety net
+    TURN_RATE = math.radians(20)        # the pace of the turns: slow, so the phone barely sways
+    SPEED = 0.08                        # m/s rolling forward
 
     def __init__(self, turn=115, speed=120, minimum=100):
-        self.turn, self.speed, self.minimum = turn, speed, minimum
+        self.turn, self.speed, self.minimum = turn, speed, minimum   # (starting powers)
         self.i, self.yaw0, self.start_pos, self.t_step = 0, None, None, None
         self.paused_from, self.paused_until, self.last_rate = 0.0, 0.0, 0.0
-        self.rate = TurnRate()
+        self.rate, self.spin, self.speedo = TurnRate(), TurnRate(0.25), Speedometer()
+        self.turn_pace, self.roll_pace = Pace(self.TURN_RATE, turn, minimum), Pace(self.SPEED, speed, minimum)
         self.forward_offset = None                      # measured on the forward roll: rover forward - phone forward
 
     @property
@@ -375,6 +443,8 @@ class ScanRoutine:
 
     def pause(self, now):
         self.paused_from, self.paused_until = now, now + self.PAUSE
+        self.turn_pace.idle()                           # (the next move starts from rest)
+        self.roll_pace.idle()
 
     def next(self, now):
         self.i, self.start_pos, self.t_step = self.i + 1, None, None
@@ -383,6 +453,7 @@ class ScanRoutine:
     def step(self, T):
         now = time.monotonic()
         rate = self.last_rate = self.rate(heading(T), now)
+        spin, speed = self.spin(heading(T), now), self.speedo(np.asarray(T)[:2, 3], now)
         if self.yaw0 is None:                           # a still moment first: the view straight ahead
             self.yaw0 = heading(T)
             self.pause(now)
@@ -401,8 +472,8 @@ class ScanRoutine:
                 return 0, 0
             if abs(rate) > self.MAX_RATE:
                 return 0, 0
-            s = self.turn if err > 0 else -self.turn
-            return with_minimum(-s, self.minimum), with_minimum(s, self.minimum)
+            p = int(round(self.turn_pace(spin, now)))   # a steady, slow turn (more to start it, see Pace)
+            return (-p, p) if err > 0 else (p, -p)
         moved = np.asarray(T)[:2, 3] - self.start_pos
         if np.linalg.norm(moved) >= amount:             # the way it rolled vs the way the phone faces: the mount
             offset = wrap(math.atan2(moved[1], moved[0]) - heading(T))
@@ -411,8 +482,9 @@ class ScanRoutine:
             self.next(now)
             return 0, 0
         err = wrap(self.yaw0 - heading(T))              # straight ahead, holding the starting heading
-        k = float(np.clip(1.2 * err, -0.5, 0.5)) * self.speed
-        return with_minimum(self.speed - k, self.minimum), with_minimum(self.speed + k, self.minimum)
+        v = self.roll_pace(speed, now)
+        k = float(np.clip(1.2 * err, -0.5, 0.5)) * v
+        return with_minimum(v - k, self.minimum), with_minimum(v + k, self.minimum)
 
 
 # ---------------------------------------------------------------------------------------- command line
