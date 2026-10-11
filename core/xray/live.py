@@ -803,6 +803,20 @@ class Qwen:
         self.proc = subprocess.Popen(qwen_command(self.folder, python) + list(extra), cwd=str(ROOT / "core"),
                                      stdout=self.log, stderr=subprocess.STDOUT)
         self.t0, self.n = time.time(), 0
+        self.lock, self.preparing = threading.Lock(), None
+
+    def prepare(self, scan):
+        """Encode the scan now, in the background (the vision encoder, ~20 s on the Jetson), so the first question
+        is answered in seconds; questions asked meanwhile wait for it."""
+        def run():
+            while not self.ready() and self.alive():
+                time.sleep(0.3)
+            self.preparing = time.time()
+            res = self.ask(scan, None)
+            self.preparing = None
+            print("Qwen-3D has read the scan" + (f": {res['error']}" if res.get("error") else
+                  f" ({res.get('seconds_after_job', '?')} s, RAM peak {res.get('ram_peak_gb', '?')} GB)"), flush=True)
+        threading.Thread(target=run, daemon=True).start()
 
     def ready(self):
         return (self.folder / "ready").exists()
@@ -819,21 +833,23 @@ class Qwen:
         return self.proc.poll() is None
 
     def ask(self, scan, text, timeout=300):
-        """One question about the scan -> the server's result (answers[0] is the answer; "error" if it failed)."""
-        self.n += 1
-        tmp = self.folder / "job.tmp"
-        tmp.write_text(json.dumps(dict(scan=str(scan), queries=[text], more=True)))
-        tmp.rename(self.folder / "job.json")
-        result, end = self.folder / "result.json", time.time() + timeout
-        while not result.exists():
-            if not self.alive():
-                return dict(error=f"Qwen-3D stopped (see {self.folder / 'qwen.log'})")
-            if time.time() > end:
-                return dict(error=f"no answer in {timeout} s")
-            time.sleep(0.1)
-        res = json.loads(result.read_text())
-        result.rename(self.folder / f"result_{self.n}.json")
-        return res
+        """One question about the scan -> the server's result (answers[0] is the answer; "error" if it failed).
+        text None: only encode the scan (prepare)."""
+        with self.lock:                                 # one job at a time
+            self.n += 1
+            tmp = self.folder / "job.tmp"
+            tmp.write_text(json.dumps(dict(scan=str(scan), queries=[] if text is None else [text], more=True)))
+            tmp.rename(self.folder / "job.json")
+            result, end = self.folder / "result.json", time.time() + timeout
+            while not result.exists():
+                if not self.alive():
+                    return dict(error=f"Qwen-3D stopped (see {self.folder / 'qwen.log'})")
+                if time.time() > end:
+                    return dict(error=f"no answer in {timeout} s")
+                time.sleep(0.1)
+            res = json.loads(result.read_text())
+            result.rename(self.folder / f"result_{self.n}.json")
+            return res
 
     def stop(self, timeout=30):
         """Tell the server to exit, and wait: its memory must be free before YOLOE loads."""
@@ -886,9 +902,48 @@ def read_console(server):
     if sys.stdin is not None and sys.stdin.isatty():
         def typed():
             for line in sys.stdin:
-                if line.strip():
-                    server.prompts.put(line.strip())
+                server.prompts.put(line.strip())        # ("" is Enter: --wait starts the scan on it)
         threading.Thread(target=typed, daemon=True).start()
+
+
+def wait_for_start(server, phone, qwen, yoloe, log=print):
+    """--wait: the camera view says what is still loading (Qwen-3D, YOLOE); once everything is, Enter in the console
+    (or POST /prompt "scan") starts the scan. yoloe: the Event set once YOLOE is loaded, or None."""
+    said, shown = False, 0.0
+    while True:
+        loading = []
+        if qwen is not None and not qwen.ready():
+            if not qwen.alive():
+                raise SystemExit(f"Qwen-3D stopped while loading; the end of {qwen.folder / 'qwen.log'}:\n  "
+                                 + qwen.note(last=8).replace(" | ", "\n  "))
+            loading.append(f"Qwen-3D {time.time() - qwen.t0:.0f} s")
+        if yoloe is not None and not yoloe.is_set():
+            loading.append("YOLOE")
+        if not loading and not said:
+            ram = ram_in_use_gb()
+            log("READY: everything is loaded" + (f" (RAM in use {ram:.2f} GB)" if ram else "")
+                + ". Press Enter (or POST /prompt 'scan') to start the scan")
+            said = True
+        while True:
+            try:
+                text = server.prompts.get_nowait().lower().strip(" .!")
+            except queue.Empty:
+                break
+            if not loading and text in ("", "scan", "start", "go"):
+                return
+            if loading:
+                log(f"still loading: {', '.join(loading)}")
+        if phone is None:
+            time.sleep(0.2)
+            continue
+        f = phone.read()
+        if time.monotonic() - shown < 0.2:
+            continue
+        shown = time.monotonic()
+        img = cv2.cvtColor(f.rgb, cv2.COLOR_RGB2BGR)
+        tag(img, ("LOADING: " + ", ".join(loading)) if loading else "READY: press Enter to scan",
+            (img.shape[1] // 2, 24), AMBER, 0.55)
+        server.publish(img, {"phase": "loading" if loading else "ready", "loading": loading})
 
 
 DRIVE_DELAY = 3.5                                       # s from Qwen-3D's answer to driving (say "stop" to cancel)
@@ -967,6 +1022,8 @@ def ask_phase(qwen, scan, server, frames, log=print, hold=None):
                 break
             word = text.lower().strip(" .!?")
             is_drive, name = drive_command(text)
+            if not word:
+                continue
             if word in ("go", "start", "track"):
                 go = True
             elif word in CANCEL_WORDS:
@@ -1033,6 +1090,8 @@ def ask_phase(qwen, scan, server, frames, log=print, hold=None):
             status = f"loading Qwen-3D ... {time.time() - qwen.t0:.0f} s" if qwen.alive() else "Qwen-3D failed (see qwen.log)"
         elif hold is not None and not hold.is_set():
             status = "Qwen-3D ready; loading YOLOE beside it ..."
+        elif qwen.preparing and not busy[0]:
+            status = f"Qwen-3D reading the scan ... {time.time() - qwen.preparing:.0f} s (ask away: it answers next)"
         elif busy[0]:
             status = f"Qwen-3D thinking: '{busy[0]}'"
         else:
@@ -1128,6 +1187,9 @@ def main(argv=None):
                     "'go' to track (the last answer is the target)")
     ap.add_argument("--qwen-args", default="", help="extra arguments for the Qwen-3D server, e.g. \"--models ~/models/qwen3d\"")
     ap.add_argument("--qwen-python", help="the Python (venv) with torch and transformers for Qwen-3D (default: this one)")
+    ap.add_argument("--wait", action="store_true",
+                    help="load the models first (Qwen-3D with --ask; YOLOE too where memory allows), then start the "
+                         "scan on Enter (or POST /prompt 'scan'): for a demo, everything ready before the rover moves")
     ap.add_argument("--qwen-stay", action="store_true",
                     help="with --ask: load YOLOE beside Qwen-3D right after the scan (go starts at once) and keep "
                          "Qwen-3D loaded through tracking, so 'drive to <description>' works then too "
@@ -1173,12 +1235,37 @@ def main(argv=None):
         if args.ask else None                           # loads while the scan runs
     if qwen is not None:
         print(f"Qwen-3D loading in its own process (log: {qwen.folder / 'qwen.log'})", flush=True)
+    cached = detect.load_detections(detect.cache_path(args.replay, labels)) if args.replay else None
+    pre = None                                          # YOLOE's engine, loaded ahead where memory allows: without
+    if qwen is None or args.qwen_stay:                  # Qwen-3D, or beside it (after its own load: one peak at a time)
+        pre = {"done": threading.Event()}
+        need = not (cached is not None and args.scan and detect.load_detections(detect.cache_path(args.scan, labels)))
+
+        def preload_yoloe():
+            try:
+                while qwen is not None and not qwen.ready() and qwen.alive():
+                    time.sleep(0.5)
+                pre["detector"] = detect.Detector(labels) if need else None
+            except Exception as e:
+                pre["error"] = e
+            finally:
+                pre["done"].set()
+        threading.Thread(target=preload_yoloe, daemon=True).start()
     phone = None
     if not args.replay:
         from .phone import Phone
         phone = Phone()
     routine = rv.ScanRoutine(*args.rover_power) \
         if args.rover_scan else None
+    if args.wait:
+        try:
+            wait_for_start(server, phone, qwen, pre["done"] if pre is not None else None)
+        except BaseException:
+            if rover is not None:
+                rover.close()
+            if qwen is not None:
+                qwen.stop()
+            raise
     try:
         scan = Path(args.scan) if args.scan else scan_with_phone(phone, args.scan_seconds, out, server, args.min_keyframes,
                                                                  rover, routine)
@@ -1192,6 +1279,8 @@ def main(argv=None):
             print(f"rover: the phone faces {math.degrees(nav.offset):+.1f} deg off the rover's forward direction", flush=True)
         else:
             print("rover: no forward roll measured; assuming the phone faces straight ahead", flush=True)
+    if qwen is not None and not args.scan:              # Qwen-3D reads the new scan now: the first answer comes quick
+        qwen.prepare(scan)
     source = fr.FolderSource(args.replay) if args.replay else phone
     to_world = None if args.replay else world_from_phone(scan)
 
@@ -1201,17 +1290,18 @@ def main(argv=None):
                 f.T = to_world @ f.T
             yield f
     answers, drive_answer = [], None
-    cached = detect.load_detections(detect.cache_path(args.replay, labels)) if args.replay else None
     early = None
     if qwen is not None and args.qwen_stay:            # both stay loaded: YOLOE loads now, beside Qwen-3D, so "go" is instant
         early = {}
 
-        def load_yoloe():                              # after Qwen-3D's own load: one memory peak at a time
+        def load_yoloe():                              # (preloaded after Qwen-3D's own load: one memory peak at a time)
             try:
-                while not qwen.ready() and qwen.alive():
-                    time.sleep(0.5)
+                pre["done"].wait()
+                if "error" in pre:
+                    raise pre["error"]
                 scan_cached = detect.load_detections(detect.cache_path(scan, labels)) is not None
-                early["detector"] = None if cached is not None and scan_cached else detect.Detector(labels)
+                early["detector"] = None if cached is not None and scan_cached else \
+                    pre["detector"] or detect.Detector(labels)
                 if early["detector"] is not None:
                     detect_keyframes(scan, early["detector"], labels)
                 early["scene"] = tk.scan_objects(scan, args.prompt, use_detector=False)
@@ -1269,7 +1359,12 @@ def main(argv=None):
                   "freed it", flush=True)
     else:
         scan_cached = detect.load_detections(detect.cache_path(scan, labels)) is not None
-        detector = None if cached is not None and scan_cached else detect.Detector(labels)
+        if pre is not None:                             # (loaded ahead)
+            pre["done"].wait()
+            if "error" in pre:
+                raise pre["error"]
+        preloaded = pre.get("detector") if pre is not None else None
+        detector = None if cached is not None and scan_cached else preloaded or detect.Detector(labels)
         if detector is not None:
             detect_keyframes(scan, detector, labels)
         objects, table = tk.scan_objects(scan, args.prompt, use_detector=False)
