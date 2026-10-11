@@ -47,6 +47,12 @@ answered in seconds. Between judges: Ctrl+C, start it again, reset the props whi
 python -m xray.live --wait --ask --ball --rover --rover-scan --video --out runs/judge1 2>&1 | tee -i judge1.log
 ```
 
+A box as a third object: `--prompt "solo cup,ball,box"` tracks cardboard boxes too. A box's twin is filled in as
+a cuboid from the sides the scan saw (`ground3d.refine.complete_box`: the smallest rectangle around it on the
+table, up to its top), it can hide a ball like a cup, and `drive to the box` drives to it. It needs that detector:
+bake it on the laptop (`python -m xray.detect bake "solo cup,ball,box"`), copy the .pt to the Jetson's `models/`, and
+export it there (`python -m xray.detect export "solo cup,ball,box"`, ~10 min).
+
 To work from a recording instead of the phone:
 
 ```bash
