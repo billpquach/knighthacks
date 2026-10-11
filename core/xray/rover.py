@@ -4,7 +4,7 @@ its odometry.
 
     python -m xray.rover ping                    # is the Arduino there (and on which port)
     python -m xray.rover test                    # each wheel forward then back, 1 s each: check wiring, directions
-    python -m xray.rover drive 120 120 1.5       # both wheels at 120 (of 255) for 1.5 s
+    python -m xray.rover drive 140 140 1.5       # both wheels at 140 (of 255) for 1.5 s
     python -m xray.live --scan-seconds 20 --ball --rover --rover-scan      # the live runner drives it
 
 With --rover the live runner listens for "drive" (or "fetch", "get it") on POST /prompt or the console while
@@ -14,9 +14,13 @@ remembered position. "stop" stops. --rover-scan turns the rover through the scan
 How it drives (Navigator): turn in place until the target is within ALIGN of straight ahead, then drive, steering
 in proportion to the angle, slower when close, and stop GAP short of the target's edge. The phone sees the floor
 from about 15 cm in front of it, so the last stretch is driven on the tracker's memory of where the target is.
-The heading is the phone's forward direction projected on the floor: mount it facing the way the rover drives.
+The heading is the phone's forward direction projected on the floor, plus the mount's angle to the rover's forward
+direction, measured during the scan's forward roll (--rover-scan) or given (--rover-forward-offset).
 
-Safety: the Arduino stops the motors when it hears nothing for 0.4 s; here a command is resent every 0.1 s only
+Serial protocol: "<left> <right>" lines, -255..255 (the earlier firmware's format, and rover/rover.ino's); "0 0"
+stops. Replies are not needed (the earlier firmware sends none).
+
+Safety: the Arduino stops the motors when it hears nothing for 0.3 s; here a command is resent every 0.1 s only
 while the runner keeps refreshing it (so a stalled runner stops the rover too); Ctrl+C, an error or the end of the
 run stop it; a drive gives up after TIMEOUT s.
 """
@@ -30,8 +34,18 @@ import time
 import numpy as np
 
 
+ARDUINO_VIDS = {0x2341, 0x2A03, 0x1A86, 0x0403, 0x10C4}      # Arduino, Arduino.org, CH340, FTDI, CP210x
+
+
 def find_port():
-    """The Arduino's serial port (an Uno is /dev/ttyACM0 on Linux), or None."""
+    """The Arduino's serial port (an Uno is /dev/ttyACM0 on Linux, a COM port on Windows), or None."""
+    try:
+        from serial.tools import list_ports
+        ports = sorted(list_ports.comports(), key=lambda p: p.vid not in ARDUINO_VIDS)
+        if ports and ports[0].vid in ARDUINO_VIDS:
+            return ports[0].device
+    except ImportError:
+        pass
     ports = sorted(glob.glob("/dev/ttyACM*")) + sorted(glob.glob("/dev/ttyUSB*"))
     return ports[0] if ports else None
 
@@ -47,7 +61,7 @@ class Rover:
             import serial                               # pip install pyserial
             port = find_port() if port == "auto" else port
             if port is None:
-                raise SystemExit("no Arduino found (/dev/ttyACM*, /dev/ttyUSB*): plug it in, or use --rover dry")
+                raise SystemExit("no Arduino found: plug it in (and close the Arduino Serial Monitor), or use --rover dry")
             try:
                 self.ser = serial.Serial(port, 115200, timeout=0.2)
             except serial.SerialException as e:
@@ -55,23 +69,24 @@ class Rover:
                                  f"or sudo chmod 666 {port})")
             time.sleep(2.0)                             # opening the port resets the Uno
             self.ser.reset_input_buffer()
-            if not self.ping():
-                raise SystemExit(f"the board on {port} doesn't answer: is rover/rover.ino uploaded?")
-            self.log(f"rover: Arduino on {port}")
+            answered = self.ping()
+            self.log(f"rover: Arduino on {port}" + ("" if answered else " (no answer to ping: fine with the earlier "
+                                                                          "firmware, which doesn't reply)"))
         else:
             self.log("rover: dry run (no motors; commands are logged)")
         threading.Thread(target=self._keepalive, daemon=True).start()
 
     def _send(self, line):
         if self.dry:
-            if line == "S" or time.monotonic() - self.sent_log > 0.5:   # (not every resend)
+            if line == "0 0" or time.monotonic() - self.sent_log > 0.5:   # (not every resend)
                 self.sent_log = time.monotonic()
                 self.log(f"rover (dry): {line}")
             return
         try:
             with self.io:                               # (the runner and the keepalive both send)
                 self.ser.write((line + "\n").encode())
-                self.ser.readline()                     # "ok" (keeps the input buffer empty)
+                if self.ser.in_waiting:
+                    self.ser.reset_input_buffer()       # (replies, if the firmware sends any, aren't needed)
         except Exception as e:                          # a lost cable: the Arduino's watchdog stops the motors
             self.log(f"rover: serial error: {e}")
 
@@ -79,8 +94,13 @@ class Rover:
         if self.dry:
             return True
         with self.io:
+            self.ser.reset_input_buffer()
             self.ser.write(b"P\n")
-            return self.ser.readline().strip() == b"pong"
+            t = time.monotonic()
+            while time.monotonic() - t < 0.5:
+                if self.ser.readline().strip() == b"pong":
+                    return True
+            return False
 
     def drive(self, left, right):
         """Wheel speeds -255..255 (positive forward). Call it every frame while driving: if the calls stop for
@@ -90,12 +110,12 @@ class Rover:
             changed = (left, right) != self.cmd
             self.cmd, self.cmd_t = (left, right), time.monotonic()
         if changed:
-            self._send(f"M {left} {right}")
+            self._send(f"{left} {right}")
 
     def stop(self):
         with self.lock:
             self.cmd, self.cmd_t = (0, 0), time.monotonic()
-        self._send("S")
+        self._send("0 0")
 
     def _keepalive(self):                               # resends the command so the Arduino's watchdog stays quiet
         while not self.closed:
@@ -108,7 +128,7 @@ class Rover:
                 self.stop()
                 self.log("rover: no fresh command for 0.5 s, stopped")
             else:
-                self._send(f"M {cmd[0]} {cmd[1]}")
+                self._send(f"{cmd[0]} {cmd[1]}")
 
     def close(self):
         if self.closed:
@@ -158,8 +178,9 @@ class Navigator:
     TIMEOUT = 25.0                      # s
     MAX_RATE = math.radians(45)         # turning faster blurs the view and can lose the phone's tracking
 
-    def __init__(self, turn=110, speed=130, minimum=80, steer=1.2):
+    def __init__(self, turn=130, speed=140, minimum=100, steer=1.2, offset=0.0):
         self.turn, self.speed, self.minimum, self.steer = turn, speed, minimum, steer
+        self.offset = offset                            # the rover's forward direction minus the phone's (radians)
         self.active, self.state, self.target_id, self.t0, self.info = False, "idle", None, 0.0, {}
         self.rate = TurnRate()
 
@@ -176,7 +197,7 @@ class Navigator:
         pos, now = np.asarray(T)[:2, 3], time.monotonic()
         rate = self.rate(heading(T), now)
         d = float(np.linalg.norm(np.asarray(target)[:2] - pos)) - radius
-        err = wrap(math.atan2(target[1] - pos[1], target[0] - pos[0]) - heading(T))
+        err = wrap(math.atan2(target[1] - pos[1], target[0] - pos[0]) - heading(T) - self.offset)
         self.info = dict(distance_m=round(d, 3), bearing_deg=round(math.degrees(err), 1))
         if d <= self.GAP:
             self.stop("arrived")
@@ -208,10 +229,11 @@ class ScanRoutine:
     STEP_TIMEOUT = 10.0                 # s for one move (then the next)
     MAX_RATE = math.radians(30)         # slow turns: sharp views and steady tracking
 
-    def __init__(self, turn=95, speed=110, minimum=80):
+    def __init__(self, turn=115, speed=120, minimum=100):
         self.turn, self.speed, self.minimum = turn, speed, minimum
         self.i, self.yaw0, self.start_pos, self.t_step, self.paused_until = 0, None, None, None, 0.0
         self.rate = TurnRate()
+        self.forward_offset = None                      # measured on the forward roll: rover forward - phone forward
 
     @property
     def done(self):
@@ -242,7 +264,11 @@ class ScanRoutine:
                 return 0, 0
             s = self.turn if err > 0 else -self.turn
             return with_minimum(-s, self.minimum), with_minimum(s, self.minimum)
-        if np.linalg.norm(np.asarray(T)[:2, 3] - self.start_pos) >= amount:
+        moved = np.asarray(T)[:2, 3] - self.start_pos
+        if np.linalg.norm(moved) >= amount:             # the way it rolled vs the way the phone faces: the mount
+            offset = wrap(math.atan2(moved[1], moved[0]) - heading(T))
+            if abs(offset) < math.radians(45):
+                self.forward_offset = offset
             self.next(now)
             return 0, 0
         err = wrap(self.yaw0 - heading(T))              # straight ahead, holding the starting heading
@@ -262,8 +288,8 @@ def main(argv=None):
         if args.cmd == "ping":
             print("pong" if rover.ping() else "no answer")
         elif args.cmd == "test":
-            for name, l, r in (("left wheel forward", 130, 0), ("left wheel back", -130, 0),
-                               ("right wheel forward", 0, 130), ("right wheel back", 0, -130)):
+            for name, l, r in (("left wheel forward", 150, 0), ("left wheel back", -150, 0),
+                               ("right wheel forward", 0, 150), ("right wheel back", 0, -150)):
                 print(f"{name} (1 s)", flush=True)
                 t = time.monotonic()
                 while time.monotonic() - t < 1.0:
@@ -271,8 +297,8 @@ def main(argv=None):
                     time.sleep(0.05)
                 rover.stop()
                 time.sleep(0.7)
-            print("If a wheel turned the wrong way, set INVERT_LEFT / INVERT_RIGHT in rover/rover.ino; if left and "
-                  "right were swapped, swap the motor wires (or the pin numbers).")
+            print("A wheel turned the wrong way: swap that motor's wires at its OUT terminal (or set INVERT_LEFT / "
+                  "INVERT_RIGHT in rover/rover.ino). Left and right swapped: swap the motors' OUT pairs.")
         else:
             if len(args.args) < 2:
                 ap.error("drive LEFT RIGHT [SECONDS]")

@@ -902,8 +902,11 @@ def main(argv=None):
                     help="drive the rover (rover/rover.ino on an Arduino): its serial port, auto (default) or dry (log only). "
                          "While tracking, \"drive\" (POST /prompt or typed) drives it to the target, \"stop\" stops it")
     ap.add_argument("--rover-scan", action="store_true", help="the rover turns and rolls through the scan by itself")
-    ap.add_argument("--rover-power", type=int, nargs=3, default=[110, 130, 80], metavar=("TURN", "DRIVE", "MIN"),
+    ap.add_argument("--rover-power", type=int, nargs=3, default=[130, 140, 100], metavar=("TURN", "DRIVE", "MIN"),
                     help="wheel power (of 255) to turn in place, to drive, and the least that moves the motors")
+    ap.add_argument("--rover-forward-offset", type=float, metavar="DEG",
+                    help="the rover's forward direction minus the phone's, in degrees (default: measured during "
+                         "--rover-scan's forward roll, else 0)")
     ap.add_argument("--min-keyframes", type=int, default=20,
                     help="the scan goes on (up to twice --scan-seconds) until it has this many views")
     ap.add_argument("--replay", help="a recorded track folder instead of the phone (same world as --scan)")
@@ -948,7 +951,7 @@ def main(argv=None):
     if args.rover_scan and (not args.rover or args.scan):
         ap.error("--rover-scan needs --rover, and a scan made now (no --scan)")
     rover = rv.Rover(args.rover) if args.rover else None
-    nav = rv.Navigator(*args.rover_power)
+    nav = rv.Navigator(*args.rover_power, offset=math.radians(args.rover_forward_offset or 0.0))
     read_console(server)
     labels = detect.parse_prompt(args.prompt)
     qwen = Qwen(out / "qwen", shlex.split(args.qwen_args), args.qwen_python and str(Path(args.qwen_python).expanduser())) \
@@ -968,6 +971,12 @@ def main(argv=None):
         if rover is not None:
             rover.close()
         raise
+    if routine is not None and args.rover_forward_offset is None:
+        if routine.forward_offset is not None:          # the phone's mount angle, from the scan's forward roll
+            nav.offset = routine.forward_offset
+            print(f"rover: the phone faces {math.degrees(nav.offset):+.1f} deg off the rover's forward direction", flush=True)
+        else:
+            print("rover: no forward roll measured; assuming the phone faces straight ahead", flush=True)
     source = fr.FolderSource(args.replay) if args.replay else phone
     to_world = None if args.replay else world_from_phone(scan)
 
