@@ -25,6 +25,9 @@ Once, before the first judges:
    mount, Record3D streaming over USB at 15 fps, Auto-Lock off.
 3. Laptop: `ssh -L 8080:localhost:8080 knighthacks@<jetson-ip>`, then http://localhost:8080 in Chrome (microphone
    allowed, the headset as input, internet on for speech recognition).
+4. Glasses: Chrome on the Beam Pro at `http://<jetson-ip>:8080/hud.html?mic=0`, one tap for full screen. `mic=0`
+   leaves the voice to the dashboard (one listener); without it the glasses also take "hey rover, ..." commands.
+   The page's options are at the top of `viewer/public/hud.html`.
 
 Each judging slot (a new `--out` each time; without the box engine, leave out `--prompt`):
 

@@ -19,15 +19,21 @@
     &side=left                        put the video on the right instead of the left
     &size=1.2                         scale all text
     &speak=0                          no spoken replies
+    &mic=0                            never listen (taps only go full screen): when the dashboard does the voice
+    &wake=0                           no wake word: every phrase is a command (only when testing alone)
   Tap once to go full screen, keep the screen awake and start listening; tap again to mute or unmute the mic.
 
-  Voice (Chrome's speech recognition; every phrase becomes POST /prompt, the same as typing in xray.live's console):
+  Voice (Chrome's speech recognition). Only what follows "hey rover" is a command, as on the dashboard: "hey rover,
+  drive", or "hey rover" and then the command within 7 s ("Jarvis" and "hey x-ray" work too). Everything else said
+  near the glasses (the pitch, the judges) is ignored. A command becomes POST /prompt, like typing in xray.live:
+    ready (--wait)            "scan"                                      -> the scan starts
     before tracking (--ask)   "find the red mug", "where is the remote"   -> a question for Qwen-3D
+                              "drive to the cup next to the box"          -> Qwen-3D picks it, then the rover drives
+                              "stop" / "cancel" in its countdown          -> it doesn't drive
                               "go" / "start tracking"                     -> Qwen-3D stops, YOLOE tracking starts
     while tracking            "where is the ball", "which cup"            -> answered here, out loud, from the state
-                              "drive" / "fetch" / "go get it", "stop"     -> the rover (xray.live --rover)
+                              "drive", "go to the green ball", "stop"     -> the rover (xray.live --rover), as said
     any time                  "hide video", "show video", "mute", "unmute"
-  A leading "Jarvis" / "hey x-ray" is ignored, so either way works.
   The mic needs a secure page: on http://, open chrome://flags/#unsafely-treat-insecure-origin-as-secure, add this
   page's origin (e.g. http://100.69.44.56:8080), Enable, Relaunch.
 -->
@@ -89,6 +95,7 @@
   let BASE = (q.get("base") || "").replace(/\/+$/, "");
   let SHOW_VIDEO = q.get("video") !== "0";
   let SPEAK = q.get("speak") !== "0";
+  const USE_MIC = q.get("mic") !== "0", NEED_WAKE = q.get("wake") !== "0";
   const BANNER_SECONDS = 6, STALE_AFTER = 3, MAX_OBJECTS = 6;
   if (q.get("size")) document.documentElement.style.setProperty("--scale", q.get("size"));
   if (q.get("side") === "left") document.getElementById("wrap").classList.add("flip");
@@ -98,6 +105,7 @@
   const img = document.getElementById("frame");
   const nocam = document.getElementById("nocam");
   if (!SHOW_VIDEO) document.getElementById("view").style.display = "none";
+  if (!USE_MIC) document.getElementById("hint").textContent = "tap for full screen";
 
   // ---------------------------------------------------------------- state stream
   let latest = null, latestAt = -1e9, es = null;
@@ -199,9 +207,17 @@
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   let rec = null, wantMic = false, micOn = false, interim = "", speaking = false;
   let voiceNote = SR ? "" : "no speech recognition in this browser (use Chrome)";
-  let lastHeard = "", lastReply = "", lastReplyClass = "gr";
-  const DRIVE = ["go get it", "get it", "fetch", "drive", "go to it", "go to the target", "drive to the target"];
+  let lastHeard = "", lastReply = "", lastReplyClass = "gr", armedUntil = 0;
   const STOP = ["stop driving", "stop", "halt"];
+  const CANCEL = ["no", "cancel", "wait", "don't"];          // during the countdown before a drive (xray.live's)
+  // xray.live's drive commands ("drive", "go to the green ball", "touch 1"), sent as said: the server reads the target.
+  // ("find ..." is left out: here it is a question for Qwen-3D.)
+  const DRIVE_WORDS = ["drive", "fetch", "get it", "go get it", "go to it", "go to the target", "drive to the target"];
+  const DRIVE_VERBS = /^(drive|fetch|get|touch|go)(?:\s+(?:over\s+)?(to|towards?|for))?\b\s*(.*)$/;
+  const isDrive = (t) => { const m = DRIVE_VERBS.exec(t); return DRIVE_WORDS.includes(t) || (!!m && !(m[1] === "go" && !m[2])); };
+  // "hey rover" as recognizers tend to hear it (the dashboard's), or "Jarvis" / "hey x-ray"
+  const WAKE = /\b(?:(?:hey|hay|hi|okay|ok|a)[\s,]+(?:rover|rovers|robert|rober|roper|robot|x-ray|xray|x ray)|jarvis)\b[\s,.:;!?-]*/i;
+  const ARMED_MS = 7000;                                    // the wake word alone: the next phrase within this is the command
 
   function say(text) {
     lastReply = text; lastReplyClass = "c";
@@ -264,15 +280,21 @@
     if (/^(mute|be quiet|quiet|stop talking)$/.test(t)) { say("Muted."); SPEAK = false; return; }
     if (/^(unmute|talk|speak|talk to me)$/.test(t)) { SPEAK = true; return say("I'm back."); }
 
+    if (phase === "loading" || phase === "ready") {
+      if (/^(scan|start|go|begin|start (the )?scan)$/.test(t)) return sendPrompt("scan", "start the scan");
+      lastReply = `"${t}": say "scan" to start`; lastReplyClass = "y";
+      return;
+    }
     if (/^(go|start|track|start tracking|begin)$/.test(t)) return sendPrompt("go", "go: start tracking");
     if (STOP.includes(t)) return sendPrompt("stop", "stop the rover");
-    if (DRIVE.some((w) => t === w || t.startsWith(w + " "))) return sendPrompt("drive", "drive the rover to the target");
+    if (phase === "ask" && CANCEL.includes(t)) return sendPrompt(t, "don't drive");
+    if (isDrive(t)) return sendPrompt(t, `rover: ${t}`);
 
     if (phase === "track" || phase === "starting") {
       if (/\b(where|which|what)\b/.test(t) && /\bball\b/.test(t)) return say(ballAnswer(s, t) || "No ball in this game.");
       if (/\bcup \d+\b/.test(t)) return say(cupAnswer(s, t));
       if (/\b(where|which)\b/.test(t) && /\bcup\b/.test(t)) return say(ballAnswer(s, t) || "No ball in this game.");
-      lastReply = `"${t}": questions go to Qwen-3D before tracking (say "where is the ball", "drive", "stop")`;
+      lastReply = `"${t}": while tracking, say "where is the ball", "drive", "go to the green ball" or "stop"`;
       lastReplyClass = "y";
       return;
     }
@@ -280,6 +302,20 @@
     // "find the red mug" -> "the red mug": the grounding model wants the thing, not the command.
     const thing = t.replace(/^(please |can you |could you )?(find|locate|show me|where is|where's|where are|look for|highlight|point to)\s+/, "") || t;
     sendPrompt(thing, `ask Qwen-3D: "${thing}"`);
+  }
+
+  function afterWake(text) {                // what follows the wake word ("" for the wake word alone), or null without it
+    const m = WAKE.exec(text);
+    return m ? text.slice(m.index + m[0].length).replace(/^(?:please|can you|could you)\s+/i, "").trim() : null;
+  }
+
+  function hear(raw) {                      // a phrase from the mic: only what follows the wake word is a command
+    if (!NEED_WAKE) return handleUtterance(raw);
+    const rest = afterWake(raw), armed = performance.now() < armedUntil;
+    if (rest === "") { armedUntil = performance.now() + ARMED_MS; return; }
+    if (rest === null && !armed) return;    // talk that isn't for the robot: the pitch, the judges
+    armedUntil = 0;
+    handleUtterance(rest ?? raw);
   }
 
   function startMic() {
@@ -294,7 +330,7 @@
         let partial = "";
         for (let i = e.resultIndex; i < e.results.length; i++) {
           const r = e.results[i];
-          if (r.isFinal) { if (!speaking) handleUtterance(r[0].transcript); }
+          if (r.isFinal) { if (!speaking) hear(r[0].transcript); }
           else partial += r[0].transcript;
         }
         interim = speaking ? "" : partial;
@@ -326,10 +362,13 @@
 
   function renderVoice() {
     const el = document.getElementById("voice");
+    if (!USE_MIC) { el.innerHTML = lastReply ? `<span class="${lastReplyClass}">${esc(lastReply)}</span>` : ""; return; }
     let h = `<span class="dot ${micOn ? "on" : "off"}"></span>`;
     if (voiceNote) h += `<span class="y">${esc(voiceNote)}</span>`;
     else if (interim) h += `<span>${esc(interim)}</span>`;
-    else if (micOn) h += `<span class="gr">listening${lastHeard ? ` · heard "${esc(lastHeard)}"` : ""}</span>`;
+    else if (micOn && performance.now() < armedUntil) h += `<span class="y">say the command</span>`;
+    else if (micOn) h += `<span class="gr">${NEED_WAKE ? `say "hey rover, ..."` : "listening"}` +
+                         `${lastHeard ? ` · heard "${esc(lastHeard)}"` : ""}</span>`;
     else h += `<span class="gr">${SR ? "mic off · tap to talk" : ""}</span>`;
     if (lastReply) h += `   <span class="${lastReplyClass}">${esc(lastReply)}</span>`;
     el.innerHTML = h;
@@ -357,8 +396,14 @@
 
     if (!s) {
       h += `<div class="big gr">Connecting to ${esc(BASE)}</div>`;
+    } else if (s.phase === "loading") {
+      h += `<div class="big c">LOADING MODELS</div><div class="gr">${esc((s.loading || []).join(", "))}</div>`;
+    } else if (s.phase === "ready") {
+      h += `<div class="huge g">READY</div><div>Say "hey rover, scan"</div>`;
     } else if (s.phase === "scan") {
-      h += `<div class="huge c">SCANNING</div><div>Walk slowly around the table</div>`;
+      const sc = s.scan || {};
+      h += `<div class="huge c">SCANNING</div><div>Building the 3D map` +
+           (typeof sc.views === "number" ? `: ${sc.views}${sc.views_wanted ? " / " + sc.views_wanted : ""} views` : "") + `</div>`;
     } else if (s.phase === "ask") {
       const qw = s.qwen || {};
       h += `<div class="big c">ASK QWEN-3D</div>`;
@@ -450,15 +495,17 @@
     // The first tap: full screen, screen awake, mic on (browsers allow these only after a tap). Later taps: mic on/off.
     if (!tapped) {
       tapped = true;
-      startMic();
+      if (USE_MIC) startMic();
       say("X-ray online.");
+    } else if (!USE_MIC) {
+      // (mic=0: taps only go full screen)
     } else if (wantMic) stopMic();
     else startMic();
     try { if (!document.fullscreenElement) await document.documentElement.requestFullscreen(); } catch {}
     try { if ("wakeLock" in navigator && !wakeLock) wakeLock = await navigator.wakeLock.request("screen"); } catch {}
     document.getElementById("hint").style.display = "none";
   });
-  window.__hud = { handleUtterance, state: () => latest, reply: () => lastReply };   // (for tests)
+  window.__hud = { handleUtterance, hear, state: () => latest, reply: () => lastReply };   // (for tests)
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") wakeLock = null; });
 
   // ---------------------------------------------------------------- pick the server, then start
