@@ -4,6 +4,7 @@ served to the glasses, the rover and the viewer.
     python -m xray.live --scan-seconds 20 [--ball] [--port 8080]                  # scan the table, then track
     python -m xray.live --scan-seconds 20 --ask [--ball]      # Qwen-3D loads during the scan; ask, then "go" to track
     python -m xray.live --scan <scan folder> [--ball | --results <ground3d output>]  # an earlier scan, same session
+    python -m xray.live --scan-seconds 25 --ball --rover --rover-scan   # the rover scans by itself; "drive" fetches the target
     python -m xray.live --scan <scan> --replay <track folder> [--ball] [--speed 1]   # a recording instead of the phone
                                                                      # (--loop: over and over, a fresh game each time)
 
@@ -73,6 +74,7 @@ import numpy as np
 
 from . import detect, render
 from . import frames as fr
+from . import rover as rv
 from . import track as tk
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -276,6 +278,49 @@ def without_clouds(state):
             v = {k: x for k, x in v.items() if k != "point_cloud"}
         out[key] = v
     return out
+
+
+def drive_target(tracker, game, track_id=None):
+    """The track to drive to: `track_id`'s, else the tracker's target (the hidden ball's cup, Qwen-3D's answer), else
+    the game's target ball while it is in the open."""
+    tracks = list(tracker.tracks) + ([b.track for b in game.balls] if game is not None else [])
+    want = track_id if track_id is not None else tracker.target_id
+    if want is None and game is not None and game.target is not None and game.target.inside is None:
+        want = game.target.track.id
+    return next((tr for tr in tracks if tr.id == want), None)
+
+
+def drive_step(server, rover, nav, tracker, game, f, log=print):
+    """One tracking frame of the rover: the prompts that start or stop it, then the wheel speeds toward the target
+    (its remembered position when unseen: the last stretch is out of the phone's view)."""
+    while True:
+        try:
+            text = server.prompts.get_nowait()
+        except queue.Empty:
+            break
+        word = text.lower().strip(" .!?")
+        if word in DRIVE_WORDS:
+            tr = drive_target(tracker, game)
+            if tr is None:
+                log("rover: no target to drive to yet")
+            else:
+                nav.start(tr.id)
+                log(f"rover: driving to {tr.label} {tr.id}")
+        elif word in STOP_WORDS:
+            nav.stop()
+            rover.stop()
+            log("rover: stopped")
+    if not nav.active:
+        return
+    tr = drive_target(tracker, game, nav.target_id)
+    if tr is None:
+        nav.stop("lost")
+    else:
+        rover.drive(*nav.step(f.T, tr.position, tr.radius))
+    if not nav.active:
+        rover.stop()
+        log(f"rover: {nav.state}" + (f", {nav.info.get('distance_m', 0) * 100:.0f} cm from {nav.target_id}'s edge"
+                                     if nav.state == "arrived" else ""))
 
 
 SWEEP_S = 2.4                                           # an answer's confidence sweep, then the answer alone
@@ -507,13 +552,19 @@ def draw_view(img, frame, tracker, game=None, fps=None, verdict=None):
 
 
 # ---------------------------------------------------------------------------------------- running
-def scan_with_phone(phone, seconds, out, server, min_keyframes=20, log=print):
+def scan_with_phone(phone, seconds, out, server, min_keyframes=20, rover=None, routine=None, log=print):
     """xray.scan's capture, in this process (the phone stays connected for tracking). It goes on past `seconds`
-    (up to twice as long) until it has `min_keyframes` views: the objects' twins need them from all sides."""
+    (up to twice as long) until it has `min_keyframes` views: the objects' twins need them from all sides. With a
+    rover and a routine (rover.ScanRoutine), the rover turns and rolls through the scan by itself."""
     from . import scan as sc
     shown, more = [0.0], [False]
 
     def progress(f, n, left):
+        if rover is not None and routine is not None and not routine.done:
+            rover.drive(*routine.step(f.T))                 # (the phone's own pose steers it)
+            if routine.done:
+                rover.stop()
+                log(f"rover: scan moves done, {n} views so far")
         if time.monotonic() - shown[0] > 0.2:
             shown[0] = time.monotonic()
             img = cv2.cvtColor(f.rgb, cv2.COLOR_RGB2BGR)
@@ -528,6 +579,8 @@ def scan_with_phone(phone, seconds, out, server, min_keyframes=20, log=print):
         more[0] = True
         keyframes, n, blurry = sc.capture(phone, 1.0, picker, progress)
         n_read, extra = n_read + n, extra + 1.0
+    if rover is not None:
+        rover.stop()
     if len(keyframes) < 8:
         raise SystemExit(f"only {len(keyframes)} keyframes: move around more (10 cm or 15 deg between keyframes)")
     shift, world = sc.fit_world(keyframes)
@@ -666,6 +719,20 @@ def answer_points(folder, a, min_points=30):
     return np.asarray([a["center"]], float), "centre"
 
 
+DRIVE_WORDS = {"drive", "fetch", "get it", "go get it", "go to it", "go to the target", "drive to the target"}
+STOP_WORDS = {"stop", "halt", "stop driving"}
+
+
+def read_console(server):
+    """Lines typed in the console become prompts, like POST /prompt (a "| tee" keeps the keyboard)."""
+    if sys.stdin is not None and sys.stdin.isatty():
+        def typed():
+            for line in sys.stdin:
+                if line.strip():
+                    server.prompts.put(line.strip())
+        threading.Thread(target=typed, daemon=True).start()
+
+
 def ask_phase(qwen, scan, server, frames, log=print):
     """Questions for Qwen-3D until "go": from POST /prompt (the dashboard, voice) or typed in the console. Meanwhile
     the camera view shows every answer's cloud (the newest one as the target), and the state stream lists the answers
@@ -701,12 +768,6 @@ def ask_phase(qwen, scan, server, frames, log=print):
                     + (f"; also weighed {weighed}" if weighed else ""))
             busy[0] = None
 
-    if sys.stdin is not None and sys.stdin.isatty():    # typed questions (a "| tee" keeps the keyboard)
-        def typed():
-            for line in sys.stdin:
-                if line.strip():
-                    server.prompts.put(line.strip())
-        threading.Thread(target=typed, daemon=True).start()
     worker = threading.Thread(target=work, daemon=True)
     worker.start()
     log('ASK: type a question (or POST /prompt {"text": ...}); "go" starts tracking')
@@ -837,6 +898,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="The live x-ray (see the top of this file)")
     ap.add_argument("--scan", help="a scan folder of this phone session (else --scan-seconds scans first)")
     ap.add_argument("--scan-seconds", type=float, default=20, help="scan for this long first (without --scan)")
+    ap.add_argument("--rover", nargs="?", const="auto", metavar="PORT",
+                    help="drive the rover (rover/rover.ino on an Arduino): its serial port, auto (default) or dry (log only). "
+                         "While tracking, \"drive\" (POST /prompt or typed) drives it to the target, \"stop\" stops it")
+    ap.add_argument("--rover-scan", action="store_true", help="the rover turns and rolls through the scan by itself")
+    ap.add_argument("--rover-power", type=int, nargs=3, default=[130, 140, 100], metavar=("TURN", "DRIVE", "MIN"),
+                    help="wheel power (of 255) to turn in place, to drive, and the least that moves the motors")
+    ap.add_argument("--rover-forward-offset", type=float, metavar="DEG",
+                    help="the rover's forward direction minus the phone's, in degrees (default: measured during "
+                         "--rover-scan's forward roll, else 0)")
     ap.add_argument("--min-keyframes", type=int, default=20,
                     help="the scan goes on (up to twice --scan-seconds) until it has this many views")
     ap.add_argument("--replay", help="a recorded track folder instead of the phone (same world as --scan)")
@@ -878,6 +948,11 @@ def main(argv=None):
         ap.error("--replay needs the --scan of the same recording")
     if args.loop and not args.replay:
         ap.error("--loop is for --replay")
+    if args.rover_scan and (not args.rover or args.scan):
+        ap.error("--rover-scan needs --rover, and a scan made now (no --scan)")
+    rover = rv.Rover(args.rover) if args.rover else None
+    nav = rv.Navigator(*args.rover_power, offset=math.radians(args.rover_forward_offset or 0.0))
+    read_console(server)
     labels = detect.parse_prompt(args.prompt)
     qwen = Qwen(out / "qwen", shlex.split(args.qwen_args), args.qwen_python and str(Path(args.qwen_python).expanduser())) \
         if args.ask else None                           # loads while the scan runs
@@ -887,7 +962,21 @@ def main(argv=None):
     if not args.replay:
         from .phone import Phone
         phone = Phone()
-    scan = Path(args.scan) if args.scan else scan_with_phone(phone, args.scan_seconds, out, server, args.min_keyframes)
+    routine = rv.ScanRoutine(turn=args.rover_power[0] - 15, speed=args.rover_power[1] - 20, minimum=args.rover_power[2]) \
+        if args.rover_scan else None
+    try:
+        scan = Path(args.scan) if args.scan else scan_with_phone(phone, args.scan_seconds, out, server, args.min_keyframes,
+                                                                 rover, routine)
+    except BaseException:
+        if rover is not None:
+            rover.close()
+        raise
+    if routine is not None and args.rover_forward_offset is None:
+        if routine.forward_offset is not None:          # the phone's mount angle, from the scan's forward roll
+            nav.offset = routine.forward_offset
+            print(f"rover: the phone faces {math.degrees(nav.offset):+.1f} deg off the rover's forward direction", flush=True)
+        else:
+            print("rover: no forward roll measured; assuming the phone faces straight ahead", flush=True)
     source = fr.FolderSource(args.replay) if args.replay else phone
     to_world = None if args.replay else world_from_phone(scan)
 
@@ -916,6 +1005,8 @@ def main(argv=None):
         finally:
             qwen.stop()
         if answers is None:                             # Ctrl+C before "go"
+            if rover is not None:
+                rover.close()
             server.close()
             if metrics is not None:
                 metrics.stop()
@@ -1064,6 +1155,9 @@ def main(argv=None):
                 server.healer.add(f, standing)
             msg = tracker.message(f, fps)
             msg["heal_version"] = server.healer.version if server.healer is not None else 0
+            if rover is not None:                       # "drive" / "stop" (POST /prompt or typed), then steer
+                drive_step(server, rover, nav, tracker, game, f)
+                msg["drive"] = nav.status()
             if game is not None:
                 msg = game.message(msg)
                 for b in game.balls:
@@ -1077,6 +1171,11 @@ def main(argv=None):
                 msg["scene"] = dict(floor_z=floor, point_cloud=dict(frame="world", points=live_cloud(f, args.live_cloud)))
             img = draw_view(cv2.cvtColor(f.rgb, cv2.COLOR_RGB2BGR), f, tracker, game, fps,
                             verdict if verdict and f.t - verdict_t < 5 else None)
+            if rover is not None and nav.state not in ("idle",):
+                d = nav.info.get("distance_m")
+                tag(img, f"ROVER: {nav.state} {'to ' + str(nav.target_id) if nav.target_id is not None else ''}"
+                    + (f", {d:.2f} m" if d is not None and nav.state in ("turning", "driving") else ""),
+                    (img.shape[1] // 2, img.shape[0] - 40), AMBER, 0.55)
             offer(out_q, (img, msg), newest=True)        # the stream never waits behind the files
             if phone is None:
                 files_q.put((img, msg, f))              # a replay keeps every frame
@@ -1090,6 +1189,8 @@ def main(argv=None):
     except RuntimeError as e:                           # the phone stopped
         print(f"stopped: {e}. {PHONE_TIP}", flush=True)
     finally:                                            # every step guarded: the files must close, the process exit
+        if rover is not None:
+            rover.close()                               # first: the motors stop
         for q, th in ((out_q, threads[1]), (files_q, threads[2])):
             try:
                 q.put(None, timeout=5)

@@ -41,6 +41,31 @@ python -m xray.live --scan <rec>/scan --replay <rec>/track --ball          # the
 python -m xray.track <rec>/track --scan <rec>/scan --ball                  # tracker + game only -> states.jsonl
 ```
 
+### Rover
+
+Two TT motors on an L298N, driven by an Arduino Uno over USB (`rover/rover.ino`) and steered by the phone's own
+pose (ARKit, in the scan's world): no wheel encoders. Wiring (also at the top of the sketch): ENA/IN1/IN2 to D5/D7/D8
+(left motor on OUT1/OUT2), ENB/IN3/IN4 to D6/D9/D10 (right motor on OUT3/OUT4), ENA/ENB jumpers off, 5V-EN jumper on,
+battery (~9 V) on 12V and GND, and the L298N GND tied to the Uno GND. Clamp the motor wires firmly in the OUT
+terminals; a wheel that spins the wrong way gets its two wires swapped. The serial line is `<left> <right>\n`
+(-255..255) at 115200, the same as the existing rover firmware, so either sketch works. Upload it with the Arduino
+IDE, then on the Jetson (`pip install pyserial`; the Uno is `/dev/ttyACM0`, `sudo usermod -aG dialout $USER`; on
+Windows it is a COM port, found by itself or given as `--rover COM4`):
+
+```bash
+python -m xray.rover ping                     # the Arduino answers (optional: other firmware stays silent)
+python -m xray.rover test                     # each wheel forward then back
+python -m xray.rover drive 140 140 1          # straight ahead for 1 s (find the least power that moves it)
+python -m xray.live --scan-seconds 25 --ball --rover --rover-scan    # scans by itself; "drive" fetches the target
+```
+
+While tracking, `drive` (typed, or `POST /prompt`) drives to the target (the hidden ball's cup, or Qwen-3D's
+answer) and stops 12 cm short; `stop` stops. `--rover dry` logs the commands instead (any replay). `--rover-power
+TURN DRIVE MIN` sets the wheel power (default 130 140 100; the L298N drops ~2 V, so the motors see ~7 V: raise it if
+the wheels hum without moving). The phone need not face exactly forward: `--rover-scan` measures the mount's angle on
+its forward roll, or give it with `--rover-forward-offset DEG`. The Arduino stops the motors if the Jetson goes quiet
+for 0.3 s; the Jetson resends ten times a second while driving.
+
 The stages: `xray.scan` (keyframes), `ground3d` (Qwen-3D INIT and `refine`: each object's digital twin),
 `xray.detect` (YOLOE), `xray.track` (3D tracking with object permanence), `xray.shell` (balls under cups),
 `xray.render` (the x-ray look) and `xray.live` (all of it, live).
