@@ -895,11 +895,12 @@ DRIVE_DELAY = 3.5                                       # s from Qwen-3D's answe
 CANCEL_WORDS = {"stop", "no", "cancel", "wait", "don't"}
 
 
-def ask_phase(qwen, scan, server, frames, log=print):
+def ask_phase(qwen, scan, server, frames, log=print, hold=None):
     """Questions for Qwen-3D until "go": from POST /prompt (the dashboard, voice) or typed in the console. Meanwhile
     the camera view shows every answer's cloud (the newest one as the target), and the state stream lists the answers
     as objects, each with its cloud. "drive to <a description>" asks Qwen-3D too, and DRIVE_DELAY s after its answer
     (unless "stop") tracking starts with that answer as the target and the rover drives to it.
+    hold: an Event the questions wait for (YOLOE loading beside Qwen-3D: one memory peak at a time).
     Returns (the answers [dict(query, score, band, seconds, point, points, ...)], the index of the one to drive to
     or None)."""
     answers, asked, busy, pending = [], queue.Queue(), [None], [None]
@@ -914,6 +915,8 @@ def ask_phase(qwen, scan, server, frames, log=print):
             wants_drive = seq > requests["cancelled"]
             while not qwen.ready() and qwen.alive():
                 time.sleep(0.2)
+            if hold is not None:
+                hold.wait(180)
             busy[0] = text
             res = qwen.ask(scan, text)
             a = (res.get("answers") or [{}])[0]
@@ -935,6 +938,7 @@ def ask_phase(qwen, scan, server, frames, log=print):
                 log(f"Qwen-3D: '{text}' -> score {a['score']:.2f} ({a['band']}) at {tk.r4(point)}, {a['seconds']:.1f} s; "
                     f"{which} cloud, {len(pts)} points" + (f" (dense cloud: {why})" if which != "refined" and why else "")
                     + (f"; RAM {res['ram_gb']} GB" if res.get("ram_gb") else "")
+                    + (f", peak {res['ram_peak_gb']} GB" if res.get("ram_peak_gb") else "")
                     + (f"; also weighed {weighed}" if weighed else ""))
             busy[0] = None
 
@@ -1027,6 +1031,8 @@ def ask_phase(qwen, scan, server, frames, log=print):
                                             for c in a["candidates"]]))
         if not qwen.ready():
             status = f"loading Qwen-3D ... {time.time() - qwen.t0:.0f} s" if qwen.alive() else "Qwen-3D failed (see qwen.log)"
+        elif hold is not None and not hold.is_set():
+            status = "Qwen-3D ready; loading YOLOE beside it ..."
         elif busy[0]:
             status = f"Qwen-3D thinking: '{busy[0]}'"
         else:
@@ -1200,8 +1206,10 @@ def main(argv=None):
     if qwen is not None and args.qwen_stay:            # both stay loaded: YOLOE loads now, beside Qwen-3D, so "go" is instant
         early = {}
 
-        def load_yoloe():
+        def load_yoloe():                              # after Qwen-3D's own load: one memory peak at a time
             try:
+                while not qwen.ready() and qwen.alive():
+                    time.sleep(0.5)
                 scan_cached = detect.load_detections(detect.cache_path(scan, labels)) is not None
                 early["detector"] = None if cached is not None and scan_cached else detect.Detector(labels)
                 if early["detector"] is not None:
@@ -1213,6 +1221,9 @@ def main(argv=None):
                       flush=True)
             except Exception as e:
                 early["error"] = e
+            finally:
+                early["done"].set()
+        early["done"] = threading.Event()
         early["thread"] = threading.Thread(target=load_yoloe, daemon=True)
         early["thread"].start()
     if qwen is not None:                                # understand, then free the memory for YOLOE
@@ -1225,7 +1236,8 @@ def main(argv=None):
                 print(f"(no /scene while asking: {e})", flush=True)
         threading.Thread(target=scan_scene, daemon=True).start()
         try:
-            answers, drive_answer = ask_phase(qwen, scan, server, in_world(frames_from(source, args.start, args.speed)))
+            answers, drive_answer = ask_phase(qwen, scan, server, in_world(frames_from(source, args.start, args.speed)),
+                                              hold=early["done"] if early is not None else None)
         except KeyboardInterrupt:
             answers = None
         except RuntimeError as e:                       # the phone stopped
@@ -1250,6 +1262,11 @@ def main(argv=None):
         if "error" in early:
             raise early["error"]
         detector, (objects, table) = early["detector"], early["scene"]
+        ram = ram_in_use_gb()
+        if ram is not None and ram > RAM_LIMIT_GB - 0.7 and qwen.alive():  # no room for a question's peak (~0.7 GB)
+            qwen.stop()
+            print(f"RAM in use {ram:.2f} GB: no room to keep Qwen-3D through tracking (a question needs ~0.7 GB more); "
+                  "freed it", flush=True)
     else:
         scan_cached = detect.load_detections(detect.cache_path(scan, labels)) is not None
         detector = None if cached is not None and scan_cached else detect.Detector(labels)
