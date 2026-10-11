@@ -13,7 +13,7 @@ Run from core/, with the venv that has torch (CUDA), transformers 4.51.1 and acc
                  heads.pth   the trained connector + mask decoder weights
                  processor/  the Qwen2.5-VL processor files
 
-Memory plan for the 8 GB board: 8-bit language model, ViT and embedding table (quant.py); the ViT is
+Memory plan for the 8 GB board: 8-bit language model (4-bit with --bits 4), ViT and embedding table (quant.py); the ViT is
 unloaded once the scan is encoded; 15 frames, or 10 if 15 runs out of memory (the ViT is still there then).
 
 Outputs (one-shot): <out>/results.json (timings, RAM, every answer), a .ply of each answer's points, and
@@ -107,7 +107,7 @@ def free_memory():
 
 
 class Grounder:
-    def __init__(self, upstream_root, weights, heads, processor, device="cuda", vit8=True, emb8=True, log=print):
+    def __init__(self, upstream_root, weights, heads, processor, device="cuda", vit8=True, emb8=True, bits=8, log=print):
         self.log, self.device = log, device
         t = time.time()
         self.up = upstream.load(upstream_root)
@@ -126,7 +126,7 @@ class Grounder:
             config.pointcloud_token_id = self.ids["<|pointcloud_pad|>"]
         self.timing = {"import": round(time.time() - t, 1)}
         t = time.time()
-        self.model = quant.load_streaming(self.up.Model, config, weights, device, vit8=vit8, emb8=emb8, log=log)
+        self.model = quant.load_streaming(self.up.Model, config, weights, device, vit8=vit8, emb8=emb8, bits=bits, log=log)
         self.hidden = None
         self.model.model.norm.register_forward_hook(lambda m, i, o: setattr(self, "hidden", o))
         self.heads = self._heads(heads)
@@ -416,6 +416,8 @@ def main(argv=None):
     ap.add_argument("--processor", help="default: <models>/processor")
     ap.add_argument("--no-vit8", action="store_true", help="keep the ViT in bf16 (more memory)")
     ap.add_argument("--no-emb8", action="store_true", help="keep the embedding table in bf16 (more memory)")
+    ap.add_argument("--bits", type=int, choices=(8, 4), default=8,
+                    help="the language model's weights: 8-bit, or 4-bit (~1.2 GB less; check its answers first)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--no-refine", action="store_true", help="skip the dense object clouds (ground3d.refine)")
     ap.add_argument("--out", help="one-shot output folder (default: runs/ground3d_HHMMSS)")
@@ -439,7 +441,7 @@ def main(argv=None):
         (jobs / "pid").write_text(str(os.getpid()))
         print(f"torch {torch.__version__}, RAM in use {ram_idle:.2f} of {Ram.total():.2f} GB", flush=True)
         g = Grounder(args.upstream, args.weights, args.heads, args.processor, args.device,
-                     vit8=not args.no_vit8, emb8=not args.no_emb8)
+                     vit8=not args.no_vit8, emb8=not args.no_emb8, bits=args.bits)
         print(f"loaded in {g.timing['import'] + g.timing['load']:.0f} s, RAM in use {ram.now:.2f} GB", flush=True)
         serve(g, jobs, args.parent, ram, args)
         return 0
@@ -449,14 +451,14 @@ def main(argv=None):
     out.mkdir(parents=True, exist_ok=True)
     res = dict(scan=str(Path(args.scan).expanduser().resolve()), queries=list(args.query), torch=torch.__version__,
                device=torch.cuda.get_device_name() if args.device == "cuda" else "cpu",
-               settings=dict(frames_asked=args.frames, vit8=not args.no_vit8, emb8=not args.no_emb8),
+               settings=dict(frames_asked=args.frames, vit8=not args.no_vit8, emb8=not args.no_emb8, bits=args.bits),
                answers=[], retries=[], error=None)
     g = sc = None
     ram_loaded = None
     print(f"torch {torch.__version__}, {res['device']}, RAM in use {ram_idle:.2f} of {Ram.total():.2f} GB", flush=True)
     try:
         g = Grounder(args.upstream, args.weights, args.heads, args.processor, args.device,
-                     vit8=not args.no_vit8, emb8=not args.no_emb8)
+                     vit8=not args.no_vit8, emb8=not args.no_emb8, bits=args.bits)
         ram_loaded = ram.now
         print(f"loaded in {g.timing['import'] + g.timing['load']:.0f} s, RAM in use {ram_loaded:.2f} GB", flush=True)
         sc = g.prepare(args.scan, args.frames, args.max_depth)

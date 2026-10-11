@@ -58,7 +58,7 @@ class Rover:
 
     def __init__(self, port="auto", swap=SWAP_SIDES, log=print):
         self.log, self.dry, self.ser, self.swap = log, port == "dry", None, swap
-        self.turn_sign, self.turn_yaw, self.turn_checked = 0, None, True
+        self.turn_sign, self.turn_yaw, self.turn_checked, self.wrong, self.last_yaw = 0, None, True, 0, None
         self.cmd, self.cmd_t, self.lock, self.io, self.closed = (0, 0), 0.0, threading.Lock(), threading.Lock(), False
         self.sent_log = 0.0
         if not self.dry:
@@ -122,21 +122,36 @@ class Rover:
             self._send(self.line(left, right))
 
     def check_turn(self, left, right, yaw):
-        """On each turn in place, once the phone has turned 15 deg: if it turned the other way than commanded, the
-        left and right motors are swapped (wiring or firmware), so swap them here for the rest of the run."""
+        """On each turn in place: if the phone turns the other way than commanded, the left and right motors are
+        swapped (wiring or firmware), so swap them here for the rest of the run. It counts from the moment the rover
+        isn't still drifting the other way from its last move (coasting past a target isn't a wrong turn), and
+        swaps only after 20 deg the wrong way twice in a row."""
+        now = time.monotonic()
+        rate = 0.0 if self.last_yaw is None else wrap(yaw - self.last_yaw[0]) / max(1e-3, now - self.last_yaw[1])
+        self.last_yaw = (yaw, now)
         sign = (1 if right > left else -1) if left * right < 0 else 0      # +1: a left turn (counterclockwise)
         if sign == 0:
-            return                                      # (pauses between turn pulses, driving ahead)
+            return                                      # (pauses between moves, driving ahead)
         if sign != self.turn_sign:
-            self.turn_sign, self.turn_yaw, self.turn_checked = sign, yaw, False
-        elif not self.turn_checked:
-            moved = wrap(yaw - self.turn_yaw)
-            if abs(moved) > math.radians(15):
-                self.turn_checked = True
-                if moved * sign < 0:
-                    self.swap = not self.swap
-                    self.log("rover: a turn went the wrong way: left and right motors swapped, fixed in software "
-                             f"(SWAP_SIDES = {self.swap} in xray/rover.py makes it permanent)")
+            self.turn_sign, self.turn_yaw, self.turn_checked = sign, None, False
+        if self.turn_checked:
+            return
+        if self.turn_yaw is None:                       # start counting once it isn't drifting the other way
+            if rate * sign >= 0 or abs(rate) < math.radians(8):
+                self.turn_yaw = yaw
+            return
+        moved = wrap(yaw - self.turn_yaw)
+        if abs(moved) < math.radians(20):
+            return
+        if moved * sign > 0:                            # the commanded way: fine for this turn
+            self.wrong, self.turn_checked = 0, True
+            return
+        self.wrong += 1
+        self.turn_yaw = yaw                             # (and keep watching this turn)
+        if self.wrong >= 2:
+            self.swap, self.wrong, self.turn_checked = not self.swap, 0, True
+            self.log("rover: turns went the wrong way: left and right motors swapped, fixed in software "
+                     f"(SWAP_SIDES = {self.swap} in xray/rover.py makes it permanent)")
 
     def stop(self):
         with self.lock:
@@ -417,6 +432,7 @@ class ScanRoutine:
     STEPS = SWEEP + (("forward", 0.15),) + SWEEP
     TOLERANCE = math.radians(5)
     PAUSE = 1.0                         # s standing still after each move
+    PAUSE_MAX = 2.5                     # ... longer, while the scan waits for its view and the phone still sways
     SETTLE = 0.4                        # s into a pause before views count (the mast stops swaying)
     STEP_TIMEOUT = 10.0                 # s for one move (then the next)
     MAX_RATE = math.radians(60)         # a safety net
@@ -427,19 +443,25 @@ class ScanRoutine:
         self.turn, self.speed, self.minimum = turn, speed, minimum   # (starting powers)
         self.i, self.yaw0, self.start_pos, self.t_step = 0, None, None, None
         self.paused_from, self.paused_until, self.last_rate = 0.0, 0.0, 0.0
+        self.wants_views, self.viewed = False, None     # (set by the scan: it waits at each stop for its view)
         self.rate, self.spin, self.speedo = TurnRate(), TurnRate(0.25), Speedometer()
         self.turn_pace, self.roll_pace = Pace(self.TURN_RATE, turn, minimum), Pace(self.SPEED, speed, minimum)
         self.forward_offset = None                      # measured on the forward roll: rover forward - phone forward
 
     @property
+    def pausing(self):
+        now = time.monotonic()
+        return now < self.paused_until or (self.wants_views and self.viewed != self.paused_from
+                                           and now < self.paused_from + self.PAUSE_MAX)
+
+    @property
     def done(self):
-        return self.i >= len(self.STEPS) and time.monotonic() >= self.paused_until
+        return self.i >= len(self.STEPS) and not self.pausing
 
     @property
     def still(self):
         """Standing still and settled: the moment for a view."""
-        now = time.monotonic()
-        return self.paused_from + self.SETTLE <= now < self.paused_until and abs(self.last_rate) < math.radians(4)
+        return self.pausing and time.monotonic() >= self.paused_from + self.SETTLE and abs(self.last_rate) < math.radians(4)
 
     def pause(self, now):
         self.paused_from, self.paused_until = now, now + self.PAUSE
@@ -457,7 +479,7 @@ class ScanRoutine:
         if self.yaw0 is None:                           # a still moment first: the view straight ahead
             self.yaw0 = heading(T)
             self.pause(now)
-        if now < self.paused_until or self.i >= len(self.STEPS):
+        if self.pausing or self.i >= len(self.STEPS):
             return 0, 0
         kind, amount = self.STEPS[self.i]
         if self.t_step is None:
