@@ -37,6 +37,9 @@ export class RobotScene {
     container.append(this.renderer.domElement);
     this.content = new THREE.Group();
     this.scene.add(this.content);
+    this.healGroup = new THREE.Group();               // the scan's holes, filled in from live depth
+    this.scene.add(this.healGroup);
+    this.heal = null;
     this.labelItems = [];
     this.observer = new ResizeObserver(() => this.resize());
     this.observer.observe(container);
@@ -107,6 +110,44 @@ export class RobotScene {
     }
     if (this.lastState) this.update(this.lastState, this.lastTarget);
     this.resize();
+  }
+
+  // Points where objects stood, seen bare since: each arrives bright and settles into the scan's colour.
+  setHeal(points, ages = []) {
+    this.healGroup.traverse(node => { node.geometry?.dispose(); node.material?.dispose(); });
+    this.healGroup.clear();
+    this.heal = null;
+    if (!points.length) return;
+    const now = performance.now() / 1000;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(points.flat(), 3));
+    geometry.setAttribute('color', new THREE.Float32BufferAttribute(new Float32Array(points.length * 3), 3));
+    const robot = new THREE.Points(geometry, new THREE.PointsMaterial({ vertexColors: true, size: .008,
+      transparent: true, opacity: .7, depthWrite: false }));
+    const map = new THREE.Points(geometry, new THREE.PointsMaterial({ vertexColors: true, size: MAP_PX.environment + .6,
+      sizeAttenuation: false, transparent: true, opacity: .9, depthWrite: false }));
+    this.healGroup.add(robot, map);
+    const tableZ = this.staticScene?.table?.z ?? 0;
+    this.heal = { robot, map, born: points.map((_, i) => now - (Number.isFinite(ages[i]) ? ages[i] : 9)),
+      base: { robot: [0.57, 0.57, 0.57], map: Array.from(xrayColors([[0, 0, tableZ]], tableZ)) } };
+    this.tintHeal(true);
+  }
+
+  tintHeal(force = false) {
+    const h = this.heal;
+    if (!h) return;
+    const now = performance.now() / 1000;
+    if (!force && now - Math.max(...h.born) > 3) return;          // all settled: nothing to redraw
+    const map = this.view === 'map';
+    h.robot.visible = !map; h.map.visible = map;
+    const base = map ? h.base.map : h.base.robot, fresh = [0.85, 1, 1];
+    const colors = h.robot.geometry.attributes.color;
+    h.born.forEach((b, i) => {
+      const k = Math.exp(-(now - b) / 0.8);                       // bright when it arrives, settled after ~2 s
+      colors.setXYZ(i, ...base.map((c, j) => c + (fresh[j] - c) * k));
+    });
+    colors.needsUpdate = true;
+    this.dirty = true;
   }
 
   clear() {
@@ -193,6 +234,7 @@ export class RobotScene {
       this.mapBounds.robot = true;
     }
     if (this.envRobot) { this.envRobot.visible = this.view !== 'map'; this.envMap.visible = this.view === 'map'; }
+    this.tintHeal(true);
     this.frameCamera();
 
     const floor = Number.isFinite(state.scene?.floor_z) ? state.scene.floor_z : 0;

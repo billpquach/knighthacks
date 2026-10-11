@@ -18,7 +18,7 @@ let state, target, selectedId = null, paused = false, source, events, generation
 let frameController, frameTimer, currentImageUrl, lastImageAt = 0, lastSeq = null, listKey = '';
 let mode = 'unknown', receivedValidState = false;
 let framePath = '/frame.jpg';
-let sceneRequest = 0, fileScene = false, sceneVersion;
+let sceneRequest = 0, fileScene = false, sceneVersion, healVersion, healBusy = false;
 let pendingState = null;
 let objectFilter = 'all';
 
@@ -66,6 +66,18 @@ function projection(view) {
 $('map-view').onclick = () => projection('map');
 $('robot-view').onclick = () => projection('robot');
 projection('robot');
+
+async function fetchHeal(token, version) {
+  healBusy = true;
+  try {
+    const response = await fetch(`${source}/scene/heal`, { cache: 'no-store', signal: AbortSignal.timeout(5000) });
+    if (!response.ok) throw new Error('No heal');
+    const data = await response.json();
+    if (token !== generation || !Array.isArray(data.points)) return;
+    healVersion = version;
+    scene?.setHeal(data.points.filter(p => Array.isArray(p) && p.length === 3 && p.every(Number.isFinite)), data.age_s);
+  } catch { /* the next message retries */ } finally { healBusy = false; }
+}
 
 async function fetchScene(token) {
   if (fileScene) return;
@@ -231,7 +243,7 @@ async function pollFrame(token) {
 
 async function connect(url) {
   const token = ++generation;
-  ++sceneRequest; fileScene = false; sceneVersion = undefined; $('scene-file').value = '';
+  ++sceneRequest; fileScene = false; sceneVersion = healVersion = undefined; scene?.setHeal([]); $('scene-file').value = '';
   source = sourceUrl(url);
   try { resources.connect(metricsUrl(resourceUrl, source)); }
   catch { resourceUrl = ''; resources.connect(`${source}/metrics`); }
@@ -268,6 +280,8 @@ async function connect(url) {
       if (Number.isFinite(version) ? version > 0 && version !== sceneVersion : pendingState.phase === 'track' && previousPhase !== 'track') {
         sceneVersion = version; fetchScene(token);
       }
+      // The scan's holes (where objects stood) fill in from live depth: fetch the patch when it grows.
+      if (Number.isFinite(pendingState.heal_version) && pendingState.heal_version !== healVersion && !healBusy) fetchHeal(token, pendingState.heal_version);
       lastStateAt = performance.now(); receivedValidState = true;
       if (pendingState.source === 'synthetic' || pendingState.source === 'replay') mode = pendingState.source;
       const label = mode === 'synthetic' ? 'SIMULATION' : mode === 'replay' ? 'REPLAY' : 'CONNECTED';

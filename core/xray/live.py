@@ -15,6 +15,8 @@ Endpoints, CORS on all (the same as replay_server.py, so the viewer and every cl
     /stream.mjpg    the x-ray view as an MJPEG stream (<img src=".../stream.mjpg">): no round trip per frame, so it
                     keeps up over a slow, far link; like /state, fewer frames there, never old ones
     /scene          the scan: table, coloured cloud, and each object's twin (for the viewer's 3D view)
+    /scene/heal     the scan's holes where objects stood, filled in from live depth as the camera sees the bare
+                    surface there: {version, points, age_s} (heal_version in each message says when it grew)
     /metrics        the Jetson's resource use (core/jetson)
     /viewer-info    {"mode": "live"}
     POST /prompt    a question for Qwen-3D, or "go" (JSON {"text": ...} or plain text): the dashboard, a voice front end
@@ -92,6 +94,7 @@ class Server:
         self.cond = threading.Condition()
         self.state, self.jpg, self.seq, self.stamp = {"phase": "scan"}, None, 0, time.time()
         self.scene, self.scene_version, self.metrics = None, 0, metrics
+        self.healer = None                              # /scene/heal: the scan's holes filled in from live depth
         self.prompts = queue.Queue()                    # questions and commands: POST /prompt, or typed in the console
         self.httpd = ThreadingHTTPServer((host, port), handler(self))
         self.httpd.daemon_threads = True
@@ -237,6 +240,10 @@ def handler(server):
                     self.send_error(404, "No scene yet")
                     return
                 self.body(server.scene, "application/json", cache="no-cache")
+            elif path == "/scene/heal":
+                h = server.healer
+                self.body(json.dumps(h.document() if h else dict(version=0, points=[], age_s=[])).encode(),
+                          "application/json", cache="no-cache")
             elif path == "/metrics":
                 latest = server.metrics.latest() if server.metrics else dict(
                     version=1, device=None, memory_kind="shared", available=False, reason="not_jetson", metrics={},
@@ -268,10 +275,65 @@ def without_clouds(state):
     return out
 
 
-def scene_json(scan, tracks, cut=(), table_z=None):
+class Healer:
+    """The scan's holes, where objects stood (cut from /scene: they move), filled in from the live depth wherever the
+    camera now sees the bare surface there: one point per 6 mm cell, each with when it came, for /scene/heal (the
+    viewer shows them arriving: the LiDAR repairing the map). heal_version in each message says when it grew."""
+
+    def __init__(self, tracks, table_z, cell=0.006, band=0.012, cap=6000):
+        self.holes = np.array([[*tr.origin[:2], tr.radius + 0.02] for tr in tracks], float).reshape(-1, 3)
+        self.table_z, self.cell, self.band, self.cap = table_z, cell, band, cap
+        self.cells, self.points, self.born = set(), [], []
+        self.version, self.now, self.lock = 0, 0.0, threading.Lock()
+
+    def add(self, f, standing):
+        """One frame's depth; standing: [(xy, radius)] of the objects there now (not surface)."""
+        self.now = float(f.t)
+        if not len(self.holes) or self.table_z is None or len(self.points) >= self.cap:
+            return
+        p = fr.backproject(f.depth, f.K, f.T, (f.conf == 2) & (f.depth > 0) & (f.depth < 2.0), 3)
+        p = p[np.abs(p[:, 2] - self.table_z) < self.band]       # the surface only (not hands, not objects)
+        if len(p):
+            inside = np.hypot(p[:, None, 0] - self.holes[None, :, 0], p[:, None, 1] - self.holes[None, :, 1]) < self.holes[None, :, 2]
+            p = p[inside.any(1)]
+        for xy, r in standing:
+            if len(p):
+                p = p[np.hypot(p[:, 0] - xy[0], p[:, 1] - xy[1]) > r + 0.015]
+        if not len(p):
+            return
+        keys, first = np.unique(np.floor(p[:, :2] / self.cell).astype(np.int64), axis=0, return_index=True)
+        with self.lock:
+            n = len(self.points)
+            for k, i in zip(map(tuple, keys), first):
+                if k not in self.cells and len(self.points) < self.cap:
+                    self.cells.add(k)
+                    self.points.append(np.round(p[i], 3).tolist())
+                    self.born.append(self.now)
+            if len(self.points) > n:
+                self.version += 1
+
+    def set_cell(self, cell):
+        """Fill as densely as the scan's cloud is (its spacing on the surface); points so far are thinned to it."""
+        with self.lock:
+            self.cell, self.cells, kept, born = float(np.clip(cell, 0.006, 0.03)), set(), [], []
+            for q, b in zip(self.points, self.born):
+                k = tuple(np.floor(np.asarray(q[:2]) / self.cell).astype(np.int64))
+                if k not in self.cells:
+                    self.cells.add(k)
+                    kept.append(q)
+                    born.append(b)
+            self.points, self.born, self.version = kept, born, self.version + 1
+
+    def document(self):
+        with self.lock:
+            return dict(version=self.version, points=list(self.points), age_s=[round(self.now - b, 2) for b in self.born])
+
+
+def scene_json(scan, tracks, cut=(), table_z=None, info=None):
     """The /scene document: the scan (viewer/tools/scene_export.py) with each object's twin as offsets from it. The
     scan's own copies of the objects (tracks and `cut`, where they stood when scanned) are taken out of the
-    environment cloud: objects move, and a copy left behind would be a ghost."""
+    environment cloud: objects move, and a copy left behind would be a ghost. info (a dict) gets the cloud's point
+    spacing on the surface around them (the healer fills the holes as densely)."""
     sys.path.insert(0, str(ROOT / "viewer" / "tools"))
     from scene_export import export_scene
     scene = export_scene(scan, table_z=table_z)
@@ -282,6 +344,14 @@ def scene_json(scan, tracks, cut=(), table_z=None):
         top = tr.origin[2] + 0.6 * float(tr.size[2]) + 0.02
         keep &= ~(reach & (env[:, 2] < top))
     scene["cloud"] = dict(points=np.round(env[keep], 5).tolist(), colors=[c for c, k in zip(colours, keep) if k])
+    objs = list(tracks) + list(cut)
+    if info is not None and objs and table_z is not None:     # surface points 10-25 cm from the objects
+        c = np.array([tr.origin[:2] for tr in objs])
+        surf = env[keep & (np.abs(env[:, 2] - table_z) < 0.012)]
+        d = np.hypot(surf[:, None, 0] - c[None, :, 0], surf[:, None, 1] - c[None, :, 1]).min(1) if len(surf) else np.zeros(0)
+        n = int(((d > 0.10) & (d < 0.25)).sum())
+        if n > 50:
+            info["surface_spacing"] = float(np.sqrt(len(c) * np.pi * (0.25 ** 2 - 0.10 ** 2) / n))
     scene["objects"] = []
     for tr in list(tracks) + list(cut):                # cups (numeric ids) and balls ("yellow ball")
         pts = np.zeros((0, 3)) if tr.points is None else \
@@ -801,10 +871,14 @@ def main(argv=None):
     tracker, game = new_game()
     def make_scene():                                   # beside the tracking: it takes seconds, and /scene can wait
         try:
+            info = {}
             server.set_scene(scene_json(scan, list(tracker.tracks), cut=[b.track for b in game.balls] if game else (),
-                                        table_z=table))
+                                        table_z=table, info=info))
+            if "surface_spacing" in info and server.healer is not None:
+                server.healer.set_cell(info["surface_spacing"])
         except Exception as e:
             print(f"(no /scene: {e})", flush=True)
+    server.healer = Healer(list(tracker.tracks) + ([b.track for b in game.balls] if game else []), table)
     threading.Thread(target=make_scene, daemon=True).start()
     floor = 0.0                                         # the scan's world has the floor at z = 0
     frames_q, out_q, stop = queue.Queue(maxsize=2), queue.Queue(maxsize=1), threading.Event()
@@ -885,6 +959,7 @@ def main(argv=None):
                 raise item
             if isinstance(item, str):                   # "again"
                 tracker, game = new_game()
+                server.healer = Healer(list(tracker.tracks) + ([b.track for b in game.balls] if game else []), table)
                 verdict, last = None, None
                 continue
             f, dets = item
@@ -895,7 +970,13 @@ def main(argv=None):
             if last is not None:
                 fps = 1 / max(1e-3, now - last) if fps is None else 0.9 * fps + 0.1 / max(1e-3, now - last)
             last = now
+            if server.healer is not None and f.index % 4 == 0:     # the bare surface where objects stood
+                standing = [(tr.position[:2], tr.radius) for tr in tracker.tracks]
+                if game is not None:
+                    standing += [(b.track.position[:2], 0.035) for b in game.balls if b.inside is None]
+                server.healer.add(f, standing)
             msg = tracker.message(f, fps)
+            msg["heal_version"] = server.healer.version if server.healer is not None else 0
             if game is not None:
                 msg = game.message(msg)
                 for b in game.balls:
