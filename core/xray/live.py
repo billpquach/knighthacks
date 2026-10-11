@@ -15,14 +15,19 @@ Endpoints, CORS on all (the same as replay_server.py, so the viewer and every cl
     /stream.mjpg    the x-ray view as an MJPEG stream (<img src=".../stream.mjpg">): no round trip per frame, so it
                     keeps up over a slow, far link; like /state, fewer frames there, never old ones
     /scene          the scan: table, coloured cloud, and each object's twin (for the viewer's 3D view)
+    /scene/heal     the scan's holes where objects stood, filled in from live depth as the camera sees the bare
+                    surface there: {version, points, age_s} (heal_version in each message says when it grew)
     /metrics        the Jetson's resource use (core/jetson)
     /viewer-info    {"mode": "live"}
     POST /prompt    a question for Qwen-3D, or "go" (JSON {"text": ...} or plain text): the dashboard, a voice front end
     /               the viewer, once built (viewer/dist)
 Every message has scene_version, which goes up each time /scene changes (fetch it again then). Until tracking
 starts the messages are {"phase": "scan"} with no objects, then with --ask {"phase": "ask"}: each
-answer as an object (id q1, q2, ..., its query, score and cloud; the newest is the target) and a "qwen" block (status,
-ready, thinking, answers), then {"phase": "starting"} while YOLOE loads, then {"phase": "track"}. Each message carries about 1500 points of
+answer as an object (id q1, q2, ..., its query, score and cloud; the newest is the target; "candidates": what Qwen-3D
+weighed and passed over, each with its score and a few points) and a "qwen" block (status, ready, thinking, answers
+with top5 scores, seconds, tokens, memory; "sweep" for the newest answer's first seconds: each point it weighed with its
+confidence), then {"phase": "starting"} while YOLOE loads, then {"phase": "track"}. The camera view shows the same:
+the sweep, the runners-up with their scores, and a card with the question, what it picked and how sure. Each message carries about 1500 points of
 the current depth frame (scene.point_cloud, for the viewer's live 3D view; --live-cloud 0: none). Every message also
 goes to <out>/states.jsonl (without the cloud); with --video the x-ray view to <out>/xray.mp4; with --record the raw frames to
 <out>/track, which --replay (or python -m xray.track) plays back.
@@ -92,6 +97,7 @@ class Server:
         self.cond = threading.Condition()
         self.state, self.jpg, self.seq, self.stamp = {"phase": "scan"}, None, 0, time.time()
         self.scene, self.scene_version, self.metrics = None, 0, metrics
+        self.healer = None                              # /scene/heal: the scan's holes filled in from live depth
         self.prompts = queue.Queue()                    # questions and commands: POST /prompt, or typed in the console
         self.httpd = ThreadingHTTPServer((host, port), handler(self))
         self.httpd.daemon_threads = True
@@ -237,6 +243,10 @@ def handler(server):
                     self.send_error(404, "No scene yet")
                     return
                 self.body(server.scene, "application/json", cache="no-cache")
+            elif path == "/scene/heal":
+                h = server.healer
+                self.body(json.dumps(h.document() if h else dict(version=0, points=[], age_s=[])).encode(),
+                          "application/json", cache="no-cache")
             elif path == "/metrics":
                 latest = server.metrics.latest() if server.metrics else dict(
                     version=1, device=None, memory_kind="shared", available=False, reason="not_jetson", metrics={},
@@ -268,10 +278,130 @@ def without_clouds(state):
     return out
 
 
-def scene_json(scan, tracks, cut=(), table_z=None):
+SWEEP_S = 2.4                                           # an answer's confidence sweep, then the answer alone
+
+
+def thin(points, n):
+    """At most n of the points, evenly through them."""
+    return points[np.linspace(0, len(points) - 1, min(len(points), n)).astype(int)] if len(points) else points
+
+
+def heat_bgr(h):
+    """Confidence 0..1 -> BGR: deep blue, cyan, amber, white."""
+    stops = np.array([[0.0, 120, 40, 10], [0.35, 230, 200, 40], [0.7, 40, 190, 255], [1.0, 235, 250, 255]])
+    return np.stack([np.interp(h, stops[:, 0], stops[:, k]) for k in (1, 2, 3)], -1)
+
+
+def draw_heat(img, heat, K, T, fade=1.0):
+    """Qwen-3D's per-point confidence glowing on the view (the strongest points biggest, drawn last)."""
+    u, v, z = render.project(heat[:, :3], K, T)
+    h, (hh, ww) = heat[:, 3], img.shape[:2]
+    ok = (z > 0.05) & (u >= 0) & (u < ww) & (v >= 0) & (v < hh)
+    if not ok.any() or fade <= 0:
+        return
+    layer, col = img.copy(), heat_bgr(h[ok])
+    for i in np.argsort(h[ok]):
+        cv2.circle(layer, (int(u[ok][i]), int(v[ok][i])), 3 if h[ok][i] > 0.5 else 2, tuple(int(c) for c in col[i]), -1)
+    cv2.addWeighted(layer, 0.85 * fade, img, 1 - 0.85 * fade, 0, img)
+
+
+def draw_candidates(img, candidates, K, T):
+    """The answers Qwen-3D weighed and passed over: faint dots and their scores."""
+    hh, ww = img.shape[:2]
+    for c in candidates:
+        u, v, z = render.project(thin(c["points"], 200), K, T)
+        ok = (z > 0.05) & (u >= 0) & (u < ww) & (v >= 0) & (v < hh)
+        if not ok.any():
+            continue
+        layer = img.copy()
+        for x, y in zip(u[ok].astype(int), v[ok].astype(int)):
+            cv2.circle(layer, (x, y), 1, (215, 215, 215), -1)
+        cv2.addWeighted(layer, 0.5, img, 0.5, 0, img)
+        top = int(np.argmin(v[ok]))
+        tag(img, f"{c['score']:.2f}", (int(u[ok][top]), int(v[ok][top]) - 8), (200, 200, 200), 0.4)
+
+
+def decision_card(img, a):
+    """The newest answer at the bottom of the view: the question, what it picked, how sure, how fast, on what; and
+    its top scores as bars (the first one picked)."""
+    hh, ww = img.shape[:2]
+    x0, y0, x1, y1 = 8, hh - 104, ww - 8, hh - 8
+    box = img[y0:y1, x0:x1]
+    box[:] = (box * 0.35).astype(np.uint8)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(img, "QWEN-3D", (x0 + 8, y0 + 18), font, 0.42, AMBER, 1, cv2.LINE_AA)
+    cv2.putText(img, f"'{a['query']}'"[:44], (x0 + 76, y0 + 18), font, 0.42, TEXT, 1, cv2.LINE_AA)
+    cv2.putText(img, f"-> {a.get('target') or 'object'}  {100 * a['score']:.0f}%", (x0 + 8, y0 + 44), font, 0.6, AMBER, 1, cv2.LINE_AA)
+    info = f"{a['seconds']:.1f} s on the Jetson, 8-bit" + (f", {a['ram_gb']:.1f} GB" if a.get("ram_gb") else "")
+    cv2.putText(img, info, (x0 + 8, y0 + 64), font, 0.4, TEXT, 1, cv2.LINE_AA)
+    top = (a.get("top5") or [a["score"]])[:5]
+    bw = (x1 - x0 - 16) // max(1, len(top))
+    for j, sc in enumerate(top):
+        bx = x0 + 8 + j * bw
+        cv2.rectangle(img, (bx, y1 - 22), (bx + bw - 6, y1 - 10), (70, 70, 70), -1)
+        cv2.rectangle(img, (bx, y1 - 22), (bx + int((bw - 6) * min(1.0, sc)), y1 - 10), AMBER if j == 0 else (170, 170, 170), -1)
+        cv2.putText(img, f"{sc:.2f}", (bx, y1 - 26), font, 0.35, AMBER if j == 0 else TEXT, 1, cv2.LINE_AA)
+
+
+class Healer:
+    """The scan's holes, where objects stood (cut from /scene: they move), filled in from the live depth wherever the
+    camera now sees the bare surface there: one point per 6 mm cell, each with when it came, for /scene/heal (the
+    viewer shows them arriving: the LiDAR repairing the map). heal_version in each message says when it grew."""
+
+    def __init__(self, tracks, table_z, cell=0.006, band=0.012, cap=6000):
+        self.holes = np.array([[*tr.origin[:2], tr.radius + 0.02] for tr in tracks], float).reshape(-1, 3)
+        self.table_z, self.cell, self.band, self.cap = table_z, cell, band, cap
+        self.cells, self.points, self.born = set(), [], []
+        self.version, self.now, self.lock = 0, 0.0, threading.Lock()
+
+    def add(self, f, standing):
+        """One frame's depth; standing: [(xy, radius)] of the objects there now (not surface)."""
+        self.now = float(f.t)
+        if not len(self.holes) or self.table_z is None or len(self.points) >= self.cap:
+            return
+        p = fr.backproject(f.depth, f.K, f.T, (f.conf == 2) & (f.depth > 0) & (f.depth < 2.0), 3)
+        p = p[np.abs(p[:, 2] - self.table_z) < self.band]       # the surface only (not hands, not objects)
+        if len(p):
+            inside = np.hypot(p[:, None, 0] - self.holes[None, :, 0], p[:, None, 1] - self.holes[None, :, 1]) < self.holes[None, :, 2]
+            p = p[inside.any(1)]
+        for xy, r in standing:
+            if len(p):
+                p = p[np.hypot(p[:, 0] - xy[0], p[:, 1] - xy[1]) > r + 0.015]
+        if not len(p):
+            return
+        keys, first = np.unique(np.floor(p[:, :2] / self.cell).astype(np.int64), axis=0, return_index=True)
+        with self.lock:
+            n = len(self.points)
+            for k, i in zip(map(tuple, keys), first):
+                if k not in self.cells and len(self.points) < self.cap:
+                    self.cells.add(k)
+                    self.points.append(np.round(p[i], 3).tolist())
+                    self.born.append(self.now)
+            if len(self.points) > n:
+                self.version += 1
+
+    def set_cell(self, cell):
+        """Fill as densely as the scan's cloud is (its spacing on the surface); points so far are thinned to it."""
+        with self.lock:
+            self.cell, self.cells, kept, born = float(np.clip(cell, 0.006, 0.03)), set(), [], []
+            for q, b in zip(self.points, self.born):
+                k = tuple(np.floor(np.asarray(q[:2]) / self.cell).astype(np.int64))
+                if k not in self.cells:
+                    self.cells.add(k)
+                    kept.append(q)
+                    born.append(b)
+            self.points, self.born, self.version = kept, born, self.version + 1
+
+    def document(self):
+        with self.lock:
+            return dict(version=self.version, points=list(self.points), age_s=[round(self.now - b, 2) for b in self.born])
+
+
+def scene_json(scan, tracks, cut=(), table_z=None, info=None):
     """The /scene document: the scan (viewer/tools/scene_export.py) with each object's twin as offsets from it. The
     scan's own copies of the objects (tracks and `cut`, where they stood when scanned) are taken out of the
-    environment cloud: objects move, and a copy left behind would be a ghost."""
+    environment cloud: objects move, and a copy left behind would be a ghost. info (a dict) gets the cloud's point
+    spacing on the surface around them (the healer fills the holes as densely)."""
     sys.path.insert(0, str(ROOT / "viewer" / "tools"))
     from scene_export import export_scene
     scene = export_scene(scan, table_z=table_z)
@@ -282,6 +412,14 @@ def scene_json(scan, tracks, cut=(), table_z=None):
         top = tr.origin[2] + 0.6 * float(tr.size[2]) + 0.02
         keep &= ~(reach & (env[:, 2] < top))
     scene["cloud"] = dict(points=np.round(env[keep], 5).tolist(), colors=[c for c, k in zip(colours, keep) if k])
+    objs = list(tracks) + list(cut)
+    if info is not None and objs and table_z is not None:     # surface points 10-25 cm from the objects
+        c = np.array([tr.origin[:2] for tr in objs])
+        surf = env[keep & (np.abs(env[:, 2] - table_z) < 0.012)]
+        d = np.hypot(surf[:, None, 0] - c[None, :, 0], surf[:, None, 1] - c[None, :, 1]).min(1) if len(surf) else np.zeros(0)
+        n = int(((d > 0.10) & (d < 0.25)).sum())
+        if n > 50:
+            info["surface_spacing"] = float(np.sqrt(len(c) * np.pi * (0.25 ** 2 - 0.10 ** 2) / n))
     scene["objects"] = []
     for tr in list(tracks) + list(cut):                # cups (numeric ids) and balls ("yellow ball")
         pts = np.zeros((0, 3)) if tr.points is None else \
@@ -552,11 +690,15 @@ def ask_phase(qwen, scan, server, frames, log=print):
                 good = which == "refined"                   # (the dense cloud's centre and size, if it is one)
                 point = ref.get("center") if good else a["center"]
                 answers.append(dict(a, point=point, points=pts, which=which, size=ref.get("size") if good else a.get("size"),
-                                    ram_gb=res.get("ram_gb")))
+                                    ram_gb=res.get("ram_gb"), arrived=time.monotonic(),
+                                    candidates=[dict(c, points=np.asarray(c["points"], float)) for c in a.get("candidates") or []],
+                                    heat=np.asarray(a.get("heat") or np.zeros((0, 4)), float).reshape(-1, 4)))
                 why = ref.get("error") or f"{ref.get('n_points', 0)} points near the answer"
+                weighed = ", ".join(f"{c['score']:.2f}" for c in a.get("candidates") or [])
                 log(f"Qwen-3D: '{text}' -> score {a['score']:.2f} ({a['band']}) at {tk.r4(point)}, {a['seconds']:.1f} s; "
                     f"{which} cloud, {len(pts)} points" + (f" (dense cloud: {why})" if which != "refined" and why else "")
-                    + (f"; RAM {res['ram_gb']} GB" if res.get("ram_gb") else ""))
+                    + (f"; RAM {res['ram_gb']} GB" if res.get("ram_gb") else "")
+                    + (f"; also weighed {weighed}" if weighed else ""))
             busy[0] = None
 
     if sys.stdin is not None and sys.stdin.isatty():    # typed questions (a "| tee" keeps the keyboard)
@@ -608,14 +750,23 @@ def ask_phase(qwen, scan, server, frames, log=print):
                     cv2.circle(img, (int(u[0]), int(v[0])), r, AMBER if newest else TEXT, 2, cv2.LINE_AA)
                     info = {"label_xy": (int(u[0]), int(v[0]) - r)}
             elif len(pts):
-                info = render.draw_cloud(img, pts, f.K, f.T, f.depth, centre=a["point"], target=newest, order_seed=200 + i)
+                age = time.monotonic() - a["arrived"]
+                if newest and age < SWEEP_S and len(a["heat"]):   # what it weighed: the sweep, then the answer
+                    draw_heat(img, a["heat"], f.K, f.T, fade=min(1.0, 2 * (1 - age / SWEEP_S)))
+                if newest:
+                    draw_candidates(img, a["candidates"], f.K, f.T)
+                if not newest or age > 0.4 * SWEEP_S:
+                    info = render.draw_cloud(img, pts, f.K, f.T, f.depth, centre=a["point"], target=newest, order_seed=200 + i)
             if info["label_xy"]:
                 tag(img, f"'{a['query']}' {a['score']:.2f}", (info["label_xy"][0], info["label_xy"][1] - 8),
                     AMBER if newest else TEXT)
             few = pts[np.linspace(0, len(pts) - 1, min(len(pts), 800)).astype(int)] if len(pts) else pts
             objects.append(dict(id=f"q{i + 1}", label="Qwen-3D answer", query=a["query"], target=newest, state="VISIBLE",
                                 position=tk.r4(a["point"]), size=a.get("size"), score=a["score"], band=a["band"],
-                                seconds=a["seconds"], point_cloud=dict(frame="world", points=np.round(few, 3).tolist())))
+                                seconds=a["seconds"], point_cloud=dict(frame="world", points=np.round(few, 3).tolist()),
+                                candidates=[dict(score=c["score"], position=c["center"], size=c.get("size"),
+                                                 point_cloud=dict(frame="world", points=np.round(thin(c["points"], 120), 3).tolist()))
+                                            for c in a["candidates"]]))
         if not qwen.ready():
             status = f"loading Qwen-3D ... {time.time() - qwen.t0:.0f} s" if qwen.alive() else "Qwen-3D failed (see qwen.log)"
         elif busy[0]:
@@ -623,12 +774,18 @@ def ask_phase(qwen, scan, server, frames, log=print):
         else:
             status = 'Qwen-3D ready: ask a question, or say "go"'
         tag(img, status, (img.shape[1] // 2, 22), AMBER, 0.5)
-        for i, a in enumerate(answers[-4:]):
-            tag(img, f"'{a['query']}': {a['score']:.2f} ({a['band']}), {a['seconds']:.1f} s", (img.shape[1] // 2, 46 + 20 * i))
+        if answers:
+            decision_card(img, answers[-1])
+        sweep = None
+        if answers and time.monotonic() - answers[-1]["arrived"] < SWEEP_S and len(answers[-1]["heat"]):
+            a = answers[-1]
+            sweep = dict(answer=f"q{len(answers)}", age_s=round(time.monotonic() - a["arrived"], 2), duration_s=SWEEP_S,
+                         heat=np.round(thin(a["heat"], 800), 3).tolist())
         msg = dict(t=round(float(f.t), 3), frame=int(f.index), phase="ask", target_id=None,
                    camera=camera_block(f.T), objects=objects,
-                   qwen=dict(status=status, ready=qwen.ready(), thinking=busy[0],
-                             answers=[{k: a[k] for k in ("query", "score", "band", "seconds", "point")} for a in answers]))
+                   qwen=dict(status=status, ready=qwen.ready(), thinking=busy[0], sweep=sweep,
+                             answers=[{k: a.get(k) for k in ("query", "target", "score", "band", "seconds", "point", "top5",
+                                                             "llm_seconds", "tokens", "gpu_peak_gb", "ram_gb")} for a in answers]))
         server.publish(img, msg)
         last = img, msg
     asked.put(None)
@@ -801,10 +958,14 @@ def main(argv=None):
     tracker, game = new_game()
     def make_scene():                                   # beside the tracking: it takes seconds, and /scene can wait
         try:
+            info = {}
             server.set_scene(scene_json(scan, list(tracker.tracks), cut=[b.track for b in game.balls] if game else (),
-                                        table_z=table))
+                                        table_z=table, info=info))
+            if "surface_spacing" in info and server.healer is not None:
+                server.healer.set_cell(info["surface_spacing"])
         except Exception as e:
             print(f"(no /scene: {e})", flush=True)
+    server.healer = Healer(list(tracker.tracks) + ([b.track for b in game.balls] if game else []), table)
     threading.Thread(target=make_scene, daemon=True).start()
     floor = 0.0                                         # the scan's world has the floor at z = 0
     frames_q, out_q, stop = queue.Queue(maxsize=2), queue.Queue(maxsize=1), threading.Event()
@@ -885,6 +1046,7 @@ def main(argv=None):
                 raise item
             if isinstance(item, str):                   # "again"
                 tracker, game = new_game()
+                server.healer = Healer(list(tracker.tracks) + ([b.track for b in game.balls] if game else []), table)
                 verdict, last = None, None
                 continue
             f, dets = item
@@ -895,7 +1057,13 @@ def main(argv=None):
             if last is not None:
                 fps = 1 / max(1e-3, now - last) if fps is None else 0.9 * fps + 0.1 / max(1e-3, now - last)
             last = now
+            if server.healer is not None and f.index % 4 == 0:     # the bare surface where objects stood
+                standing = [(tr.position[:2], tr.radius) for tr in tracker.tracks]
+                if game is not None:
+                    standing += [(b.track.position[:2], 0.035) for b in game.balls if b.inside is None]
+                server.healer.add(f, standing)
             msg = tracker.message(f, fps)
+            msg["heal_version"] = server.healer.version if server.healer is not None else 0
             if game is not None:
                 msg = game.message(msg)
                 for b in game.balls:

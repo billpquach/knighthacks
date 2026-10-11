@@ -270,10 +270,46 @@ class Grounder:
                  size=np.round(pts.max(0) - pts.min(0), 3).tolist() if len(pts) else None,
                  seconds=round(time.time() - t0, 2), llm_seconds=round(t_llm, 2), tokens=L,
                  gpu_peak_gb=round(torch.cuda.max_memory_allocated() / GB, 2) if dev == "cuda" else None)
+        try:                                                # what it weighed, for the viewer (never fails the answer)
+            r.update(reasoning(out["pred_masks"][0], scores, order, best, sc.target_xyz))
+        except Exception as e:
+            r["reasoning_error"] = f"{type(e).__name__}: {str(e)[:200]}"
         del out, up, point, text
         if dev == "cuda":
             torch.cuda.empty_cache()
         return r, pts
+
+
+@torch.no_grad()
+def reasoning(masks, scores, order, best, xyz, runners=3, look=12, cloud=300, heat=2000):
+    """What Qwen-3D weighed besides its answer, for the viewer. candidates: the next-best decoder queries (score,
+    centre, size, up to `cloud` points), leaving out those mostly overlapping the answer or each other. heat: each
+    scan point's [x, y, z, h], h = the highest score x mask probability over the top queries (where over 0.05):
+    the objects it considered glow as strongly as it believed in them."""
+    top = order[:look].tolist()
+    probs = masks[top].float().sigmoid()                          # [look, points]
+    xyz_np = xyz.float().cpu().numpy()
+    on = (probs > 0.5).cpu().numpy()
+    taken, cands = [on[0]], []                                     # order[0] is the answer
+    for j, q in enumerate(top[1:], 1):
+        m = on[j]
+        n = int(m.sum())
+        if float(scores[q]) < 0.05:                                # (the rest is noise)
+            break
+        if n < 20 or any((m & t).sum() / max(1, (m | t).sum()) > 0.3 for t in taken):
+            continue
+        taken.append(m)
+        p = xyz_np[m]
+        pick = np.linspace(0, n - 1, min(n, cloud)).astype(int)
+        cands.append(dict(score=round(float(scores[q]), 4), center=np.round(p.mean(0), 3).tolist(),
+                          size=np.round(p.max(0) - p.min(0), 3).tolist(), n_points=n, points=np.round(p[pick], 3).tolist()))
+        if len(cands) >= runners:
+            break
+    h = (probs[:6] * scores[top[:6]].float()[:, None]).max(0).values.cpu().numpy()
+    keep = np.nonzero(h > 0.05)[0]
+    if len(keep) > heat:
+        keep = keep[np.argsort(-h[keep])[:heat]]
+    return dict(candidates=cands, heat=np.round(np.c_[xyz_np[keep], h[keep]], 3).tolist())
 
 
 def write_ply(path, pts):
