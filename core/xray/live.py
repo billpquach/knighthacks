@@ -61,6 +61,7 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -602,33 +603,65 @@ def draw_view(img, frame, tracker, game=None, fps=None, verdict=None):
 
 
 # ---------------------------------------------------------------------------------------- running
+class StillPicker:
+    """xray.scan's KeyframePicker, taking one view each time the rover stands still (ScanRoutine.still): the first
+    sharp one of that stop."""
+
+    def __init__(self, picker, routine):
+        self.picker, self.routine, self.taken = picker, routine, None
+
+    def offer(self, f):
+        stop = self.routine.paused_from
+        if not self.routine.still or stop == self.taken or not self.picker.offer(f):
+            return False
+        self.taken = stop
+        return True
+
+    def __getattr__(self, name):
+        return getattr(self.picker, name)
+
+
 def scan_with_phone(phone, seconds, out, server, min_keyframes=20, rover=None, routine=None, log=print):
     """xray.scan's capture, in this process (the phone stays connected for tracking). It goes on past `seconds`
     (up to twice as long) until it has `min_keyframes` views: the objects' twins need them from all sides. With a
-    rover and a routine (rover.ScanRoutine), the rover turns and rolls through the scan by itself."""
+    rover and a routine (rover.ScanRoutine), the rover turns and rolls through the scan by itself, stopping for each
+    view, and the scan lasts as long as its moves."""
     from . import scan as sc
     shown, more = [0.0], [False]
+    roving = rover is not None and routine is not None
 
     def progress(f, n, left):
-        if rover is not None and routine is not None and not routine.done:
+        if roving and not routine.done:
             rover.drive(*routine.step(f.T), yaw=rv.heading(f.T))      # (the phone's own pose steers it)
             if routine.done:
                 rover.stop()
-                log(f"rover: scan moves done, {n} views so far")
+                log(f"rover: scan moves done, {n} views")
         if time.monotonic() - shown[0] > 0.2:
             shown[0] = time.monotonic()
             img = cv2.cvtColor(f.rgb, cv2.COLOR_RGB2BGR)
-            text = f"SCANNING: keep circling the cups, {n}/{min_keyframes} views" if more[0] else \
-                f"SCANNING: circle the cups slowly  {max(0.0, left):4.1f} s, {n}/{min_keyframes} views"
+            if roving:
+                text = f"SCANNING: the rover looks around, {n} views" + ("  (still: a view)" if routine.still else "")
+            elif more[0]:
+                text = f"SCANNING: keep circling the cups, {n}/{min_keyframes} views"
+            else:
+                text = f"SCANNING: circle the cups slowly  {max(0.0, left):4.1f} s, {n}/{min_keyframes} views"
             tag(img, text, (img.shape[1] // 2, 24))
             server.publish(img, {"phase": "scan", "scan": {"views": n, "views_wanted": min_keyframes}})
-    picker = sc.KeyframePicker()
-    keyframes, n_read, blurry = sc.capture(phone, seconds, picker, progress)
-    extra = 0.0
-    while len(keyframes) < min_keyframes and extra < seconds:      # too few views yet: keep going
-        more[0] = True
-        keyframes, n, blurry = sc.capture(phone, 1.0, picker, progress)
-        n_read, extra = n_read + n, extra + 1.0
+    if roving:
+        picker = StillPicker(sc.KeyframePicker(move=0.03, turn=5.0), routine)      # (one view per stop)
+        n_read, t0 = 0, time.monotonic()
+        keyframes = []
+        while not routine.done and time.monotonic() - t0 < max(60.0, 3 * seconds):
+            keyframes, n, blurry = sc.capture(phone, 0.5, picker, progress)
+            n_read += n
+    else:
+        picker = sc.KeyframePicker()
+        keyframes, n_read, blurry = sc.capture(phone, seconds, picker, progress)
+        extra = 0.0
+        while len(keyframes) < min_keyframes and extra < seconds:      # too few views yet: keep going
+            more[0] = True
+            keyframes, n, blurry = sc.capture(phone, 1.0, picker, progress)
+            n_read, extra = n_read + n, extra + 1.0
     if rover is not None:
         rover.stop()
     if len(keyframes) < 8:
@@ -636,6 +669,8 @@ def scan_with_phone(phone, seconds, out, server, min_keyframes=20, rover=None, r
     shift, world = sc.fit_world(keyframes)
     sc.apply(shift, keyframes)
     folder = Path(out) / "scan"
+    if folder.exists():                                 # a reused --out: no old keyframes or detections mixed in
+        shutil.rmtree(folder)
     sc.write_scan(folder, keyframes, shift, source="record3d", stream=phone.info, world=world)
     log(f"scan: {len(keyframes)} keyframes of {n_read} frames -> {folder}")
     return folder
@@ -644,7 +679,8 @@ def scan_with_phone(phone, seconds, out, server, min_keyframes=20, rover=None, r
 def detect_keyframes(scan, detector, labels, log=print):
     """The scan's detections with the detector already loaded (one model in memory), cached for refine."""
     path = detect.cache_path(scan, labels)
-    if detect.load_detections(path) is None:
+    cached = detect.load_detections(path)
+    if cached is None or set(cached) != set(fr.frame_ids(scan)):      # (none yet, or another scan's)
         out, shape = {}, None
         for k in fr.frame_ids(scan):
             rgb = fr.read_frame(scan, k)[0]
@@ -926,6 +962,8 @@ class Recorder:
         """xray.frames.write_frame's layout, written faster (light PNG compression): it runs beside a live loop."""
         k = self.n
         if k == 0:
+            if self.folder.exists():                    # a reused --out: this run's frames only
+                shutil.rmtree(self.folder)
             for d in ("color", "depth", "conf", "intrinsic", "pose"):
                 (self.folder / d).mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(self.folder / "color" / f"{k}.jpg"), cv2.cvtColor(f.rgb, cv2.COLOR_RGB2BGR),
@@ -954,7 +992,7 @@ def main(argv=None):
                     help="drive the rover (rover/rover.ino on an Arduino): its serial port, auto (default) or dry (log only). "
                          "While tracking, \"drive\" (POST /prompt or typed) drives it to the target, \"stop\" stops it")
     ap.add_argument("--rover-scan", action="store_true", help="the rover turns and rolls through the scan by itself")
-    ap.add_argument("--rover-power", type=int, nargs=3, default=[130, 140, 100], metavar=("TURN", "DRIVE", "MIN"),
+    ap.add_argument("--rover-power", type=int, nargs=3, default=[115, 120, 100], metavar=("TURN", "DRIVE", "MIN"),
                     help="wheel power (of 255) to turn in place, to drive, and the least that moves the motors")
     ap.add_argument("--rover-size", type=float, nargs=2, default=[0.11, 0.15], metavar=("FRONT", "WIDTH"),
                     help="metres from the phone to the rover's front edge, and the rover's width (default 0.11 0.15)")
@@ -1017,7 +1055,7 @@ def main(argv=None):
     if not args.replay:
         from .phone import Phone
         phone = Phone()
-    routine = rv.ScanRoutine(turn=args.rover_power[0] - 15, speed=args.rover_power[1] - 20, minimum=args.rover_power[2]) \
+    routine = rv.ScanRoutine(*args.rover_power) \
         if args.rover_scan else None
     try:
         scan = Path(args.scan) if args.scan else scan_with_phone(phone, args.scan_seconds, out, server, args.min_keyframes,
