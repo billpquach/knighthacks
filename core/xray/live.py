@@ -23,8 +23,11 @@ Endpoints, CORS on all (the same as replay_server.py, so the viewer and every cl
     /               the viewer, once built (viewer/dist)
 Every message has scene_version, which goes up each time /scene changes (fetch it again then). Until tracking
 starts the messages are {"phase": "scan"} with no objects, then with --ask {"phase": "ask"}: each
-answer as an object (id q1, q2, ..., its query, score and cloud; the newest is the target) and a "qwen" block (status,
-ready, thinking, answers), then {"phase": "starting"} while YOLOE loads, then {"phase": "track"}. Each message carries about 1500 points of
+answer as an object (id q1, q2, ..., its query, score and cloud; the newest is the target; "candidates": what Qwen-3D
+weighed and passed over, each with its score and a few points) and a "qwen" block (status, ready, thinking, answers
+with top5 scores, seconds, tokens, memory; "sweep" for the newest answer's first seconds: each point it weighed with its
+confidence), then {"phase": "starting"} while YOLOE loads, then {"phase": "track"}. The camera view shows the same:
+the sweep, the runners-up with their scores, and a card with the question, what it picked and how sure. Each message carries about 1500 points of
 the current depth frame (scene.point_cloud, for the viewer's live 3D view; --live-cloud 0: none). Every message also
 goes to <out>/states.jsonl (without the cloud); with --video the x-ray view to <out>/xray.mp4; with --record the raw frames to
 <out>/track, which --replay (or python -m xray.track) plays back.
@@ -273,6 +276,71 @@ def without_clouds(state):
             v = {k: x for k, x in v.items() if k != "point_cloud"}
         out[key] = v
     return out
+
+
+SWEEP_S = 2.4                                           # an answer's confidence sweep, then the answer alone
+
+
+def thin(points, n):
+    """At most n of the points, evenly through them."""
+    return points[np.linspace(0, len(points) - 1, min(len(points), n)).astype(int)] if len(points) else points
+
+
+def heat_bgr(h):
+    """Confidence 0..1 -> BGR: deep blue, cyan, amber, white."""
+    stops = np.array([[0.0, 120, 40, 10], [0.35, 230, 200, 40], [0.7, 40, 190, 255], [1.0, 235, 250, 255]])
+    return np.stack([np.interp(h, stops[:, 0], stops[:, k]) for k in (1, 2, 3)], -1)
+
+
+def draw_heat(img, heat, K, T, fade=1.0):
+    """Qwen-3D's per-point confidence glowing on the view (the strongest points biggest, drawn last)."""
+    u, v, z = render.project(heat[:, :3], K, T)
+    h, (hh, ww) = heat[:, 3], img.shape[:2]
+    ok = (z > 0.05) & (u >= 0) & (u < ww) & (v >= 0) & (v < hh)
+    if not ok.any() or fade <= 0:
+        return
+    layer, col = img.copy(), heat_bgr(h[ok])
+    for i in np.argsort(h[ok]):
+        cv2.circle(layer, (int(u[ok][i]), int(v[ok][i])), 3 if h[ok][i] > 0.5 else 2, tuple(int(c) for c in col[i]), -1)
+    cv2.addWeighted(layer, 0.85 * fade, img, 1 - 0.85 * fade, 0, img)
+
+
+def draw_candidates(img, candidates, K, T):
+    """The answers Qwen-3D weighed and passed over: faint dots and their scores."""
+    hh, ww = img.shape[:2]
+    for c in candidates:
+        u, v, z = render.project(thin(c["points"], 200), K, T)
+        ok = (z > 0.05) & (u >= 0) & (u < ww) & (v >= 0) & (v < hh)
+        if not ok.any():
+            continue
+        layer = img.copy()
+        for x, y in zip(u[ok].astype(int), v[ok].astype(int)):
+            cv2.circle(layer, (x, y), 1, (215, 215, 215), -1)
+        cv2.addWeighted(layer, 0.5, img, 0.5, 0, img)
+        top = int(np.argmin(v[ok]))
+        tag(img, f"{c['score']:.2f}", (int(u[ok][top]), int(v[ok][top]) - 8), (200, 200, 200), 0.4)
+
+
+def decision_card(img, a):
+    """The newest answer at the bottom of the view: the question, what it picked, how sure, how fast, on what; and
+    its top scores as bars (the first one picked)."""
+    hh, ww = img.shape[:2]
+    x0, y0, x1, y1 = 8, hh - 104, ww - 8, hh - 8
+    box = img[y0:y1, x0:x1]
+    box[:] = (box * 0.35).astype(np.uint8)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(img, "QWEN-3D", (x0 + 8, y0 + 18), font, 0.42, AMBER, 1, cv2.LINE_AA)
+    cv2.putText(img, f"'{a['query']}'"[:44], (x0 + 76, y0 + 18), font, 0.42, TEXT, 1, cv2.LINE_AA)
+    cv2.putText(img, f"-> {a.get('target') or 'object'}  {100 * a['score']:.0f}%", (x0 + 8, y0 + 44), font, 0.6, AMBER, 1, cv2.LINE_AA)
+    info = f"{a['seconds']:.1f} s on the Jetson, 8-bit" + (f", {a['ram_gb']:.1f} GB" if a.get("ram_gb") else "")
+    cv2.putText(img, info, (x0 + 8, y0 + 64), font, 0.4, TEXT, 1, cv2.LINE_AA)
+    top = (a.get("top5") or [a["score"]])[:5]
+    bw = (x1 - x0 - 16) // max(1, len(top))
+    for j, sc in enumerate(top):
+        bx = x0 + 8 + j * bw
+        cv2.rectangle(img, (bx, y1 - 22), (bx + bw - 6, y1 - 10), (70, 70, 70), -1)
+        cv2.rectangle(img, (bx, y1 - 22), (bx + int((bw - 6) * min(1.0, sc)), y1 - 10), AMBER if j == 0 else (170, 170, 170), -1)
+        cv2.putText(img, f"{sc:.2f}", (bx, y1 - 26), font, 0.35, AMBER if j == 0 else TEXT, 1, cv2.LINE_AA)
 
 
 class Healer:
@@ -622,11 +690,15 @@ def ask_phase(qwen, scan, server, frames, log=print):
                 good = which == "refined"                   # (the dense cloud's centre and size, if it is one)
                 point = ref.get("center") if good else a["center"]
                 answers.append(dict(a, point=point, points=pts, which=which, size=ref.get("size") if good else a.get("size"),
-                                    ram_gb=res.get("ram_gb")))
+                                    ram_gb=res.get("ram_gb"), arrived=time.monotonic(),
+                                    candidates=[dict(c, points=np.asarray(c["points"], float)) for c in a.get("candidates") or []],
+                                    heat=np.asarray(a.get("heat") or np.zeros((0, 4)), float).reshape(-1, 4)))
                 why = ref.get("error") or f"{ref.get('n_points', 0)} points near the answer"
+                weighed = ", ".join(f"{c['score']:.2f}" for c in a.get("candidates") or [])
                 log(f"Qwen-3D: '{text}' -> score {a['score']:.2f} ({a['band']}) at {tk.r4(point)}, {a['seconds']:.1f} s; "
                     f"{which} cloud, {len(pts)} points" + (f" (dense cloud: {why})" if which != "refined" and why else "")
-                    + (f"; RAM {res['ram_gb']} GB" if res.get("ram_gb") else ""))
+                    + (f"; RAM {res['ram_gb']} GB" if res.get("ram_gb") else "")
+                    + (f"; also weighed {weighed}" if weighed else ""))
             busy[0] = None
 
     if sys.stdin is not None and sys.stdin.isatty():    # typed questions (a "| tee" keeps the keyboard)
@@ -678,14 +750,23 @@ def ask_phase(qwen, scan, server, frames, log=print):
                     cv2.circle(img, (int(u[0]), int(v[0])), r, AMBER if newest else TEXT, 2, cv2.LINE_AA)
                     info = {"label_xy": (int(u[0]), int(v[0]) - r)}
             elif len(pts):
-                info = render.draw_cloud(img, pts, f.K, f.T, f.depth, centre=a["point"], target=newest, order_seed=200 + i)
+                age = time.monotonic() - a["arrived"]
+                if newest and age < SWEEP_S and len(a["heat"]):   # what it weighed: the sweep, then the answer
+                    draw_heat(img, a["heat"], f.K, f.T, fade=min(1.0, 2 * (1 - age / SWEEP_S)))
+                if newest:
+                    draw_candidates(img, a["candidates"], f.K, f.T)
+                if not newest or age > 0.4 * SWEEP_S:
+                    info = render.draw_cloud(img, pts, f.K, f.T, f.depth, centre=a["point"], target=newest, order_seed=200 + i)
             if info["label_xy"]:
                 tag(img, f"'{a['query']}' {a['score']:.2f}", (info["label_xy"][0], info["label_xy"][1] - 8),
                     AMBER if newest else TEXT)
             few = pts[np.linspace(0, len(pts) - 1, min(len(pts), 800)).astype(int)] if len(pts) else pts
             objects.append(dict(id=f"q{i + 1}", label="Qwen-3D answer", query=a["query"], target=newest, state="VISIBLE",
                                 position=tk.r4(a["point"]), size=a.get("size"), score=a["score"], band=a["band"],
-                                seconds=a["seconds"], point_cloud=dict(frame="world", points=np.round(few, 3).tolist())))
+                                seconds=a["seconds"], point_cloud=dict(frame="world", points=np.round(few, 3).tolist()),
+                                candidates=[dict(score=c["score"], position=c["center"], size=c.get("size"),
+                                                 point_cloud=dict(frame="world", points=np.round(thin(c["points"], 120), 3).tolist()))
+                                            for c in a["candidates"]]))
         if not qwen.ready():
             status = f"loading Qwen-3D ... {time.time() - qwen.t0:.0f} s" if qwen.alive() else "Qwen-3D failed (see qwen.log)"
         elif busy[0]:
@@ -693,12 +774,18 @@ def ask_phase(qwen, scan, server, frames, log=print):
         else:
             status = 'Qwen-3D ready: ask a question, or say "go"'
         tag(img, status, (img.shape[1] // 2, 22), AMBER, 0.5)
-        for i, a in enumerate(answers[-4:]):
-            tag(img, f"'{a['query']}': {a['score']:.2f} ({a['band']}), {a['seconds']:.1f} s", (img.shape[1] // 2, 46 + 20 * i))
+        if answers:
+            decision_card(img, answers[-1])
+        sweep = None
+        if answers and time.monotonic() - answers[-1]["arrived"] < SWEEP_S and len(answers[-1]["heat"]):
+            a = answers[-1]
+            sweep = dict(answer=f"q{len(answers)}", age_s=round(time.monotonic() - a["arrived"], 2), duration_s=SWEEP_S,
+                         heat=np.round(thin(a["heat"], 800), 3).tolist())
         msg = dict(t=round(float(f.t), 3), frame=int(f.index), phase="ask", target_id=None,
                    camera=camera_block(f.T), objects=objects,
-                   qwen=dict(status=status, ready=qwen.ready(), thinking=busy[0],
-                             answers=[{k: a[k] for k in ("query", "score", "band", "seconds", "point")} for a in answers]))
+                   qwen=dict(status=status, ready=qwen.ready(), thinking=busy[0], sweep=sweep,
+                             answers=[{k: a.get(k) for k in ("query", "target", "score", "band", "seconds", "point", "top5",
+                                                             "llm_seconds", "tokens", "gpu_peak_gb", "ram_gb")} for a in answers]))
         server.publish(img, msg)
         last = img, msg
     asked.put(None)

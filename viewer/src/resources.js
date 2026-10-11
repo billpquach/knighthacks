@@ -61,10 +61,26 @@ export class ResourcePanel {
     }
   }
 
+  // A moment on the shared-memory graph (Qwen-3D loaded, freed for YOLOE).
+  mark(label) {
+    this.marks = [...(this.marks || []), { t: performance.now(), label }].slice(-6);
+    for (const row of this.rows || []) if (row.id === 'memory') this.draw(row);
+  }
+
   draw(row) {
     const ctx = row.canvas.getContext('2d');
     ctx.clearRect(0, 0, 240, 28);
     const valid = row.history.filter(p => p.value !== null);
+    if (row.id === 'memory') {
+      const now = performance.now();
+      ctx.font = '7px sans-serif'; ctx.fillStyle = '#f4d06c'; ctx.strokeStyle = '#f4d06c88'; ctx.lineWidth = 1;
+      for (const m of this.marks || []) {
+        const x = 240 - (now - m.t) / 60000 * 240;
+        if (x < 0) continue;
+        ctx.setLineDash([2, 2]); ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, 28); ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillText(m.label, Math.min(x + 2, 240 - ctx.measureText(m.label).width), 7);
+      }
+    }
     if (!valid.length) return;
     const max = ['memory', 'gpu', 'cpu'].includes(row.id) ? 100 : Math.max(...valid.map(p => p.value), 1) * 1.15;
     const now = performance.now(); ctx.strokeStyle = row.color; ctx.lineWidth = 1.5; ctx.beginPath();

@@ -139,3 +139,17 @@ input::file-selector-button { color: #dedede; background: #292929; border: 1px s
   *, *::before, *::after, input::file-selector-button { transition: none !important; animation: none !important; }
   button:active:not(:disabled) { transform: none; }
 }
+
+/* Qwen-3D reasoning: the runners-up's score tags and the decision card */
+.object-label.candidate { padding: 3px 6px; color: #c9d4de; border-left-color: #6d7d8b; font-size: 9px; background: #101010cc; }
+#qwen-card { position: absolute; left: 16px; top: 52px; z-index: 3; width: min(320px, calc(100% - 32px)); padding: 10px 12px; background: #0d0d0deb; border: 1px solid var(--line); border-left: 2px solid var(--yellow); border-radius: 3px; font-size: 10px; color: #d9d9d9; pointer-events: none; }
+#qwen-card .qc-head { color: var(--yellow); font-size: 9px; font-weight: 700; letter-spacing: .04em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#qwen-card .qc-query { color: #e8e8e8; font-weight: 400; letter-spacing: 0; margin-left: 6px; }
+#qwen-card .qc-pick { margin-top: 5px; color: var(--yellow); font-size: 17px; font-weight: 600; }
+#qwen-card .qc-info { margin-top: 3px; color: #a8a8a8; font-size: 9px; }
+#qwen-card .qc-bars { display: flex; gap: 6px; margin-top: 8px; }
+#qwen-card .qc-bar { flex: 1; font-size: 8px; color: #9a9a9a; }
+#qwen-card .qc-bar i { display: block; height: 5px; margin-top: 2px; background: #8a8a8a; border-radius: 1px; box-shadow: inset 0 0 0 9999px #00000000; }
+#qwen-card .qc-bar { background: linear-gradient(#0000 11px, #2a2a2a 11px, #2a2a2a 16px, #0000 16px); }
+#qwen-card .qc-bar.picked { color: var(--yellow); }
+#qwen-card .qc-bar.picked i { background: var(--yellow); }
