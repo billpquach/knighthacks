@@ -710,7 +710,7 @@ def scan_with_phone(phone, seconds, out, server, min_keyframes=20, rover=None, r
             else:
                 text = f"SCANNING: circle the cups slowly  {max(0.0, left):4.1f} s, {n}/{min_keyframes} views"
             tag(img, text, (img.shape[1] // 2, 24))
-            server.publish(img, {"phase": "scan", "scan": {"views": n, "views_wanted": min_keyframes}})
+            server.publish(img, {"phase": "scan", "scan": {"views": n, "views_wanted": min_keyframes}, "objects": []})
     if roving:
         picker = StillPicker(sc.KeyframePicker(move=0.03, turn=5.0), routine)      # (one view per stop)
         n_read, t0 = 0, time.monotonic()
@@ -993,7 +993,7 @@ def wait_for_start(server, phone, qwen, yoloe, log=print):
         img = cv2.cvtColor(f.rgb, cv2.COLOR_RGB2BGR)
         tag(img, ("LOADING: " + ", ".join(loading)) if loading else "READY: press Enter to scan",
             (img.shape[1] // 2, 24), AMBER, 0.55)
-        server.publish(img, {"phase": "loading" if loading else "ready", "loading": loading})
+        server.publish(img, {"phase": "loading" if loading else "ready", "loading": loading, "objects": []})
 
 
 DRIVE_DELAY = 3.5                                       # s from Qwen-3D's answer to driving (say "stop" to cancel)
