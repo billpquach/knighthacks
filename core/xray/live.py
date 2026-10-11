@@ -406,6 +406,8 @@ def drive_step(server, rover, nav, tracker, game, f, log=print, late=None):
         except queue.Empty:
             break
         tr, note = late.answer(res, tracker, game)
+        if res.get("ram_peak_gb") or res.get("ram_gb"):
+            note += f"; RAM peak {res.get('ram_peak_gb') or res.get('ram_gb')} GB"
         if tr is None:
             log(f"rover: Qwen-3D on '{text}': {note}")
         else:
@@ -844,6 +846,19 @@ class Qwen:
         self.log.close()
 
 
+def ram_in_use_gb():
+    """The whole board's memory in use (GB): on the Jetson the CPU and GPU share it."""
+    try:
+        info = dict(line.split(":", 1) for line in open("/proc/meminfo"))
+        kb = lambda k: float(info[k].split()[0])
+        return (kb("MemTotal") - kb("MemAvailable")) / 1024 ** 2
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+RAM_LIMIT_GB = 6.3                                      # the 8 GB Jetson's practical ceiling (its GPU allocator fails above)
+
+
 def camera_block(T):
     return dict(position=tk.r4(T[:3, 3]), forward=tk.r4(T[:3, 2]), T_world_cam=np.round(T[:3].reshape(-1), 5).tolist())
 
@@ -1108,7 +1123,8 @@ def main(argv=None):
     ap.add_argument("--qwen-args", default="", help="extra arguments for the Qwen-3D server, e.g. \"--models ~/models/qwen3d\"")
     ap.add_argument("--qwen-python", help="the Python (venv) with torch and transformers for Qwen-3D (default: this one)")
     ap.add_argument("--qwen-stay", action="store_true",
-                    help="with --ask: keep Qwen-3D loaded through tracking, so 'drive to <description>' works then too "
+                    help="with --ask: load YOLOE beside Qwen-3D right after the scan (go starts at once) and keep "
+                         "Qwen-3D loaded through tracking, so 'drive to <description>' works then too "
                          "(it needs --qwen-args \"--bits 4\" to fit beside YOLOE on the 8 GB Jetson; its answers are about "
                          "the scan, and go to the object that stood there, wherever it is now)")
     ap.add_argument("--results", help="target = Qwen-3D's first answer (a python -m ground3d.ground --out folder)")
@@ -1179,6 +1195,26 @@ def main(argv=None):
                 f.T = to_world @ f.T
             yield f
     answers, drive_answer = [], None
+    cached = detect.load_detections(detect.cache_path(args.replay, labels)) if args.replay else None
+    early = None
+    if qwen is not None and args.qwen_stay:            # both stay loaded: YOLOE loads now, beside Qwen-3D, so "go" is instant
+        early = {}
+
+        def load_yoloe():
+            try:
+                scan_cached = detect.load_detections(detect.cache_path(scan, labels)) is not None
+                early["detector"] = None if cached is not None and scan_cached else detect.Detector(labels)
+                if early["detector"] is not None:
+                    detect_keyframes(scan, early["detector"], labels)
+                early["scene"] = tk.scan_objects(scan, args.prompt, use_detector=False)
+                ram = ram_in_use_gb()
+                print("YOLOE ready beside Qwen-3D" + (f", RAM in use {ram:.2f} GB" if ram else "")
+                      + (f" (near the {RAM_LIMIT_GB} GB limit: try --qwen-args \"--bits 4\")" if ram and ram > RAM_LIMIT_GB - 0.5 else ""),
+                      flush=True)
+            except Exception as e:
+                early["error"] = e
+        early["thread"] = threading.Thread(target=load_yoloe, daemon=True)
+        early["thread"].start()
     if qwen is not None:                                # understand, then free the memory for YOLOE
         def scan_scene():                               # the scan's cloud for the viewer while questions are asked
             try:                                        # (no objects yet: tracking replaces it with the twins)
@@ -1208,13 +1244,18 @@ def main(argv=None):
                 os._exit(0)
             return 0
         print(f"Qwen-3D done: {len(answers)} answers; " + ("it stays loaded (--qwen-stay)" if args.qwen_stay else
-              "its memory is free") + "; loading YOLOE", flush=True)
-    cached = detect.load_detections(detect.cache_path(args.replay, labels)) if args.replay else None
-    scan_cached = detect.load_detections(detect.cache_path(scan, labels)) is not None
-    detector = None if cached is not None and scan_cached else detect.Detector(labels)
-    if detector is not None:
-        detect_keyframes(scan, detector, labels)
-    objects, table = tk.scan_objects(scan, args.prompt, use_detector=False)
+              "its memory is free; loading YOLOE"), flush=True)
+    if early is not None:
+        early["thread"].join()
+        if "error" in early:
+            raise early["error"]
+        detector, (objects, table) = early["detector"], early["scene"]
+    else:
+        scan_cached = detect.load_detections(detect.cache_path(scan, labels)) is not None
+        detector = None if cached is not None and scan_cached else detect.Detector(labels)
+        if detector is not None:
+            detect_keyframes(scan, detector, labels)
+        objects, table = tk.scan_objects(scan, args.prompt, use_detector=False)
     print(f"scene: {len(objects)} objects, table at {table if table is None else round(table, 3)} m: "
           + ", ".join(f"{o['label']} at {tk.r4(o['position'])}" for o in objects), flush=True)
     pick = [answers[drive_answer]] if drive_answer is not None else \
