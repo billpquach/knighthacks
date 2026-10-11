@@ -993,7 +993,7 @@ def main(argv=None):
                          "While tracking, \"drive\" (POST /prompt or typed) drives it to the target, \"stop\" stops it")
     ap.add_argument("--rover-scan", action="store_true", help="the rover turns and rolls through the scan by itself")
     ap.add_argument("--rover-power", type=int, nargs=3, default=[115, 120, 100], metavar=("TURN", "DRIVE", "MIN"),
-                    help="wheel power (of 255) to turn in place, to drive, and the least that moves the motors")
+                    help="starting wheel power (of 255) to turn in place and to drive, and the least it ever uses; from there it finds by itself what starts the wheels and keeps a slow, steady pace")
     ap.add_argument("--rover-size", type=float, nargs=2, default=[0.11, 0.15], metavar=("FRONT", "WIDTH"),
                     help="metres from the phone to the rover's front edge, and the rover's width (default 0.11 0.15)")
     ap.add_argument("--rover-forward-offset", type=float, metavar="DEG",
