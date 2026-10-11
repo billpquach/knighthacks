@@ -56,7 +56,7 @@ Windows it is a COM port, found by itself or given as `--rover COM4`):
 python -m xray.rover ping                     # the Arduino answers (optional: other firmware stays silent)
 python -m xray.rover test                     # each wheel forward then back; drive -130 130 1 must turn left
 python -m xray.rover drive 140 140 1          # straight ahead for 1 s (find the least power that moves it)
-python -m xray.live --scan-seconds 25 --ball --rover --rover-scan    # scans by itself; "drive" fetches the target
+python -m xray.live --ball --rover --rover-scan    # scans by itself (about 25 s); "drive" fetches the target
 ```
 
 While tracking, `drive` (typed, or `POST /prompt`) drives to the target (the hidden ball's cup, or Qwen-3D's
@@ -64,8 +64,10 @@ answer); `drive to cup 2`, `drive to the yellow ball` (its cup, if it is under o
 stops. It goes around the other cups and balls (via a point beside the target when the straight way is blocked), gently
 touches a cup with its front edge, and stops 3 cm short of a ball in the open. `--rover-size FRONT WIDTH` (metres, default
 0.11 0.15) is the phone-to-front-edge distance and the rover's width. `--rover dry` logs the commands instead (any replay). `--rover-power
-TURN DRIVE MIN` sets the wheel power (default 130 140 100; the L298N drops ~2 V, so the motors see ~7 V: raise it if
-the wheels hum without moving). The phone need not face exactly forward: `--rover-scan` measures the mount's angle on
+TURN DRIVE MIN` sets the wheel power (default 115 120 100: one steady, slow speed, no slowing down; the L298N drops
+~2 V, so the motors see ~7 V: raise it if the wheels hum without moving). The rover's scan stops and shoots: 20 deg
+turns across 80 deg, a 15 cm roll, the same again, and one view at each stop once the phone has stopped swaying
+(18 sharp views). The phone need not face exactly forward: `--rover-scan` measures the mount's angle on
 its forward roll, or give it with `--rover-forward-offset DEG`. Left and right swapped (`drive -130 130 1` turns right): `SWAP_SIDES` in `xray/rover.py`
 (`--swap 0|1` to try); while driving, a turn that goes the wrong way swaps them by itself. The Arduino stops the motors if
 the Jetson goes quiet for 0.3 s; the Jetson resends ten times a second while driving.

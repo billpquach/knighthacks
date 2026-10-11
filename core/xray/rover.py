@@ -5,7 +5,7 @@ its odometry.
     python -m xray.rover ping                    # is the Arduino there (and on which port)
     python -m xray.rover test                    # each wheel forward then back, 1 s each: check wiring, directions
     python -m xray.rover drive 140 140 1.5       # both wheels at 140 (of 255) for 1.5 s
-    python -m xray.live --scan-seconds 20 --ball --rover --rover-scan      # the live runner drives it
+    python -m xray.live --ball --rover --rover-scan      # the live runner drives it
 
 With --rover the live runner listens for "drive" (or "fetch", "get it") on POST /prompt or the console while
 tracking, and drives to the target: the tracker's target (the hidden ball's cup, or Qwen-3D's answer), at its
@@ -13,7 +13,7 @@ remembered position; "drive to cup 2" / "drive to the yellow ball" name one. "st
 rover through the scan by itself.
 
 How it drives (Navigator): turn in place until the target is within ALIGN of straight ahead, then drive, steering
-in proportion to the angle, slower when close; touch a cup with the front edge, stop GAP short of a ball; go around
+in proportion to the angle, at one steady speed; touch a cup with the front edge, stop GAP short of a ball; go around
 the other objects via an approach point beside the target when the straight way is blocked. The phone sees the floor
 from about 15 cm in front of it, so the last stretch is driven on the tracker's memory of where the target is.
 The heading is the phone's forward direction projected on the floor, plus the mount's angle to the rover's forward
@@ -216,9 +216,9 @@ class Navigator:
     CLEAR = 0.025                       # kept between the rover's body and an obstacle's edge
     AT_POINT = 0.03                     # an approach point counts as reached this close
     TIMEOUT = 30.0                      # s
-    MAX_RATE = math.radians(45)         # turning faster blurs the view and can lose the phone's tracking
+    MAX_RATE = math.radians(90)         # a safety net (the turn power sets the speed): faster loses the tracking
 
-    def __init__(self, turn=130, speed=140, minimum=100, steer=1.2, offset=0.0, front=0.11, width=0.15):
+    def __init__(self, turn=115, speed=120, minimum=100, steer=1.2, offset=0.0, front=0.11, width=0.15):
         self.turn, self.speed, self.minimum, self.steer = turn, speed, minimum, steer
         self.offset = offset                            # the rover's forward direction minus the phone's (radians)
         self.front, self.half_width = front, width / 2  # the front edge ahead of the phone; half the rover's width
@@ -315,7 +315,7 @@ class Navigator:
             if self.touch and gap <= self.APPROACH and abs(err) < self.ALIGN:
                 self.state, self.creep = "touching", (now, pos.copy(), now + 0.4)    # (a moment to get going)
                 return 0, 0
-            moving, slow = "driving", gap
+            moving = "driving"
             if gap <= self.APPROACH:                    # close: only straight ahead (never sideways into it)
                 realign = self.ALIGN
             else:
@@ -323,7 +323,7 @@ class Navigator:
         else:
             aim = self.approach
             err = wrap(math.atan2(aim[1] - pos[1], aim[0] - pos[0]) - yaw)
-            moving, slow, realign = "detour", float(np.linalg.norm(aim - pos)), self.REALIGN
+            moving, realign = "detour", self.REALIGN
         if self.state in ("driving", "detour") and abs(err) > realign or \
                 self.state not in ("driving", "detour") and abs(err) > self.ALIGN:
             self.state = "turning"                      # err > 0: the target is to the left: turn left
@@ -332,7 +332,7 @@ class Navigator:
             s = self.turn if err > 0 else -self.turn
             return with_minimum(-s, self.minimum), with_minimum(s, self.minimum)
         self.state = moving
-        v = self.speed * min(1.0, max(0.6, slow / 0.4))     # slower over the last 40 cm
+        v = self.speed                                  # one steady, slow speed (no slowing down: no lurches)
         k = float(np.clip(self.steer * err, -0.6, 0.6)) * v
         return with_minimum(v - k, self.minimum), with_minimum(v + k, self.minimum)
 
@@ -343,34 +343,51 @@ class Navigator:
 
 
 class ScanRoutine:
-    """The rover's own scan: look left and right, roll forward a little, look again (headings relative to where it
-    started), pausing after each move so the scan gets sharp views. step() each frame until done."""
-    STEPS = (("turn", 40), ("turn", -40), ("turn", 0), ("forward", 0.15), ("turn", 40), ("turn", -40), ("turn", 0))
-    TOLERANCE = math.radians(6)
-    PAUSE = 0.6                         # s still after each move
+    """The rover's own scan, stop and shoot: turn in 20 deg steps to 40 deg left, across to 40 deg right and back to
+    where it started, roll forward 15 cm, and the same again (headings relative to the start). After each move it
+    stands still for PAUSE, and the scan takes its views only then (`still`), once the phone has stopped wobbling on
+    its mast: every view sharp, none smeared by a turn. step() each frame until done."""
+    SWEEP = (("turn", 20), ("turn", 40), ("turn", 20), ("turn", 0),
+             ("turn", -20), ("turn", -40), ("turn", -20), ("turn", 0))
+    STEPS = SWEEP + (("forward", 0.15),) + SWEEP
+    TOLERANCE = math.radians(5)
+    PAUSE = 1.0                         # s standing still after each move
+    SETTLE = 0.4                        # s into a pause before views count (the mast stops swaying)
     STEP_TIMEOUT = 10.0                 # s for one move (then the next)
-    MAX_RATE = math.radians(30)         # slow turns: sharp views and steady tracking
+    MAX_RATE = math.radians(60)         # a safety net (the turn power sets the speed)
 
     def __init__(self, turn=115, speed=120, minimum=100):
         self.turn, self.speed, self.minimum = turn, speed, minimum
-        self.i, self.yaw0, self.start_pos, self.t_step, self.paused_until = 0, None, None, None, 0.0
+        self.i, self.yaw0, self.start_pos, self.t_step = 0, None, None, None
+        self.paused_from, self.paused_until, self.last_rate = 0.0, 0.0, 0.0
         self.rate = TurnRate()
         self.forward_offset = None                      # measured on the forward roll: rover forward - phone forward
 
     @property
     def done(self):
-        return self.i >= len(self.STEPS)
+        return self.i >= len(self.STEPS) and time.monotonic() >= self.paused_until
+
+    @property
+    def still(self):
+        """Standing still and settled: the moment for a view."""
+        now = time.monotonic()
+        return self.paused_from + self.SETTLE <= now < self.paused_until and abs(self.last_rate) < math.radians(4)
+
+    def pause(self, now):
+        self.paused_from, self.paused_until = now, now + self.PAUSE
 
     def next(self, now):
-        self.i, self.start_pos, self.t_step, self.paused_until = self.i + 1, None, None, now + self.PAUSE
+        self.i, self.start_pos, self.t_step = self.i + 1, None, None
+        self.pause(now)
 
     def step(self, T):
         now = time.monotonic()
-        rate = self.rate(heading(T), now)
-        if self.done or now < self.paused_until:
-            return 0, 0
-        if self.yaw0 is None:
+        rate = self.last_rate = self.rate(heading(T), now)
+        if self.yaw0 is None:                           # a still moment first: the view straight ahead
             self.yaw0 = heading(T)
+            self.pause(now)
+        if now < self.paused_until or self.i >= len(self.STEPS):
+            return 0, 0
         kind, amount = self.STEPS[self.i]
         if self.t_step is None:
             self.t_step, self.start_pos = now, np.asarray(T)[:2, 3].copy()
