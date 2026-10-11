@@ -19,7 +19,8 @@ Endpoints, CORS on all (the same as replay_server.py, so the viewer and every cl
     /viewer-info    {"mode": "live"}
     POST /prompt    a question for Qwen-3D, or "go" (JSON {"text": ...} or plain text): the dashboard, a voice front end
     /               the viewer, once built (viewer/dist)
-Until tracking starts the messages are {"phase": "scan"} with no objects, then with --ask {"phase": "ask"}: each
+Every message has scene_version, which goes up each time /scene changes (fetch it again then). Until tracking
+starts the messages are {"phase": "scan"} with no objects, then with --ask {"phase": "ask"}: each
 answer as an object (id q1, q2, ..., its query, score and cloud; the newest is the target) and a "qwen" block (status,
 ready, thinking, answers), then {"phase": "starting"} while YOLOE loads, then {"phase": "track"}. Each message carries about 1500 points of
 the current depth frame (scene.point_cloud, for the viewer's live 3D view; --live-cloud 0: none). Every message also
@@ -90,7 +91,7 @@ class Server:
     def __init__(self, host="0.0.0.0", port=8080, metrics=None):
         self.cond = threading.Condition()
         self.state, self.jpg, self.seq, self.stamp = {"phase": "scan"}, None, 0, time.time()
-        self.scene, self.metrics = None, metrics
+        self.scene, self.scene_version, self.metrics = None, 0, metrics
         self.prompts = queue.Queue()                    # questions and commands: POST /prompt, or typed in the console
         self.httpd = ThreadingHTTPServer((host, port), handler(self))
         self.httpd.daemon_threads = True
@@ -104,9 +105,14 @@ class Server:
         with self.cond:
             if jpg is not None:
                 self.jpg, self.seq, self.stamp = jpg, self.seq + 1, time.time()
-            if state is not None:
-                self.state = state
+            if state is not None:                       # (scene_version first: "scene" stays the last key)
+                self.state = {"scene_version": self.scene_version, **state}
             self.cond.notify_all()
+
+    def set_scene(self, doc):
+        """A new /scene document; each message's scene_version tells clients to fetch it again."""
+        with self.cond:
+            self.scene, self.scene_version = doc, self.scene_version + 1
 
     def close(self):
         self.httpd.shutdown()
@@ -735,6 +741,14 @@ def main(argv=None):
             yield f
     answers = []
     if qwen is not None:                                # understand, then free the memory for YOLOE
+        def scan_scene():                               # the scan's cloud for the viewer while questions are asked
+            try:                                        # (no objects yet: tracking replaces it with the twins)
+                kf = tk.rf.load_keyframes(scan)
+                z = tk.rf.table_height(kf)
+                server.set_scene(scene_json(scan, (), table_z=z if z is not None else tk.rf.table_height(kf, lo=-0.15, hi=0.3)))
+            except Exception as e:
+                print(f"(no /scene while asking: {e})", flush=True)
+        threading.Thread(target=scan_scene, daemon=True).start()
         try:
             answers = ask_phase(qwen, scan, server, in_world(frames_from(source, args.start, args.speed)))
         except KeyboardInterrupt:
@@ -787,8 +801,8 @@ def main(argv=None):
     tracker, game = new_game()
     def make_scene():                                   # beside the tracking: it takes seconds, and /scene can wait
         try:
-            server.scene = scene_json(scan, list(tracker.tracks), cut=[b.track for b in game.balls] if game else (),
-                                      table_z=table)
+            server.set_scene(scene_json(scan, list(tracker.tracks), cut=[b.track for b in game.balls] if game else (),
+                                        table_z=table))
         except Exception as e:
             print(f"(no /scene: {e})", flush=True)
     threading.Thread(target=make_scene, daemon=True).start()

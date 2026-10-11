@@ -4,6 +4,19 @@ import { calibrate, G8_LENS, validLens } from './calibration.js';
 
 const colors = { yellow: 0xf4d06c, green: 0x91dc83, red: 0xff8877, purple: 0xd89fec, blue: 0x8cbafa };
 const hidden = o => o.state !== 'VISIBLE';
+// The memory map is drawn from above with an orthographic camera, where point sizes are pixels, not metres.
+const MAP_PX = { environment: 2.6, live: 1.6, occluder: 2.6, object: 3.6, ball: 4.6 };
+
+// X-ray blue-cyan by height above the table: the surface dark, anything standing on it bright. Bluer than the
+// objects' teal and yellow, so they stand out on it.
+function xrayColors(points, tableZ) {
+  const out = new Float32Array(points.length * 3);
+  points.forEach(([, , z], i) => {
+    const t = Math.min(1, Math.max(0, (z - tableZ + 0.03) / 0.25));
+    out.set([0.05 + 0.3 * t, 0.16 + 0.55 * t, 0.3 + 0.65 * t], i * 3);
+  });
+  return out;
+}
 
 export class RobotScene {
   constructor(container, labels) {
@@ -74,16 +87,23 @@ export class RobotScene {
     this.staticScene = data;
     this.mapBounds = null;
     this.lens = validLens(data?.camera) ? data.camera : G8_LENS;
+    this.envRobot = this.envMap = null;
     if (data) {
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.Float32BufferAttribute(data.cloud.points.flat(), 3));
-      this.environment.add(new THREE.Points(geometry, new THREE.PointsMaterial({ color: 0x929292,
-        size: .008, transparent: true, opacity: .48, depthWrite: false })));
+      this.envRobot = new THREE.Points(geometry, new THREE.PointsMaterial({ color: 0x929292,
+        size: .008, transparent: true, opacity: .48, depthWrite: false }));
+      const mapGeometry = geometry.clone();
+      mapGeometry.setAttribute('color', new THREE.Float32BufferAttribute(xrayColors(data.cloud.points, data.table.z), 3));
+      this.envMap = new THREE.Points(mapGeometry, new THREE.PointsMaterial({ vertexColors: true, size: MAP_PX.environment,
+        sizeAttenuation: false, transparent: true, opacity: .85, depthWrite: false }));
+      this.environment.add(this.envRobot, this.envMap);
       const outline = data.table.outline.map(p => new THREE.Vector3(...p, data.table.z));
       if (outline.length >= 3) this.environment.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(outline),
         new THREE.LineBasicMaterial({ color: 0xaaaaaa, transparent: true, opacity: .4 })));
-      if (outline.length) this.mapBounds = new THREE.Box3().setFromPoints(outline);
-      else if (data.cloud.points.length) this.mapBounds = new THREE.Box3().setFromBufferAttribute(geometry.attributes.position);
+      // The map frames the objects (and the robot, added on the next update), not the whole scan.
+      // (no objects in the scene yet: the next update frames the state's objects, e.g. Qwen-3D's answers)
+      if (data.objects.length) this.mapBounds = new THREE.Box3().setFromPoints(data.objects.map(o => new THREE.Vector3(...o.position)));
     }
     if (this.lastState) this.update(this.lastState, this.lastTarget);
     this.resize();
@@ -101,12 +121,13 @@ export class RobotScene {
     this.labelItems = [];
   }
 
-  points(positions, color, size, xray = false, opacity = 1) {
+  points(positions, color, size, xray = false, opacity = 1, mapPx = MAP_PX.object) {
     if (!positions.length) return;
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    const material = new THREE.PointsMaterial({ color, size, transparent: true, opacity,
-      depthTest: !xray, depthWrite: !xray, sizeAttenuation: true });
+    const map = this.view === 'map';
+    const material = new THREE.PointsMaterial({ color, size: map ? mapPx : size, transparent: true, opacity,
+      depthTest: !xray, depthWrite: !xray, sizeAttenuation: !map });
     const points = new THREE.Points(geometry, material);
     points.renderOrder = xray ? 3 : 0;
     this.content.add(points);
@@ -167,6 +188,11 @@ export class RobotScene {
       : validLens(this.staticScene?.camera) ? this.staticScene.camera : G8_LENS;
     if (!this.mapBounds) this.mapBounds = new THREE.Box3().setFromPoints(
       [...state.objects, ...state.balls, { position: pose.position }].map(o => new THREE.Vector3(...o.position)));
+    else if (!this.mapBounds.robot) {                   // the robot stays in the frame too
+      this.mapBounds.expandByPoint(new THREE.Vector3(...pose.position));
+      this.mapBounds.robot = true;
+    }
+    if (this.envRobot) { this.envRobot.visible = this.view !== 'map'; this.envMap.visible = this.view === 'map'; }
     this.frameCamera();
 
     const floor = Number.isFinite(state.scene?.floor_z) ? state.scene.floor_z : 0;
@@ -176,11 +202,11 @@ export class RobotScene {
     grid.material.transparent = true;
     grid.material.opacity = 0.38;
     this.content.add(grid);
-    this.points(cloudPositions(state.scene?.point_cloud), 0x637b71, 0.003, false, 0.45);
+    this.points(cloudPositions(state.scene?.point_cloud), 0x637b71, 0.003, false, 0.45, MAP_PX.live);
 
     for (const occluder of state.occluders) {
       this.box(occluder, 0x9da99f, true);
-      this.points(cloudPositions(occluder.point_cloud, occluder.position), 0x9da99f, 0.0028, false, 0.5);
+      this.points(cloudPositions(occluder.point_cloud, occluder.position), 0x9da99f, 0.0028, false, 0.5, MAP_PX.occluder);
     }
     let clouds = !!this.staticScene?.cloud.points.length;
     for (const object of [...state.objects, ...state.balls]) {
@@ -190,7 +216,8 @@ export class RobotScene {
       const points = cloudPositions(model?.points.length ? { frame: 'object', points: model.points } : object.point_cloud, object.position, 2000);
       if (points.length) {
         clouds = true;
-        this.points(points, color, object.color ? 0.0025 : 0.0019, true, hidden(object) ? 0.9 : 0.75);
+        this.points(points, color, object.color ? 0.0025 : 0.0019, true, hidden(object) ? 0.9 : 0.75,
+          object.color ? MAP_PX.ball : MAP_PX.object);
       } else this.box(object, color);
       this.label(object, selected);
     }

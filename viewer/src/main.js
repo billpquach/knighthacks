@@ -18,7 +18,7 @@ let state, target, selectedId = null, paused = false, source, events, generation
 let frameController, frameTimer, currentImageUrl, lastImageAt = 0, lastSeq = null, listKey = '';
 let mode = 'unknown', receivedValidState = false;
 let framePath = '/frame.jpg';
-let sceneRequest = 0, fileScene = false;
+let sceneRequest = 0, fileScene = false, sceneVersion;
 let pendingState = null;
 let objectFilter = 'all';
 
@@ -231,7 +231,7 @@ async function pollFrame(token) {
 
 async function connect(url) {
   const token = ++generation;
-  ++sceneRequest; fileScene = false; $('scene-file').value = '';
+  ++sceneRequest; fileScene = false; sceneVersion = undefined; $('scene-file').value = '';
   source = sourceUrl(url);
   try { resources.connect(metricsUrl(resourceUrl, source)); }
   catch { resourceUrl = ''; resources.connect(`${source}/metrics`); }
@@ -262,7 +262,12 @@ async function connect(url) {
       const previousPhase = pendingState?.phase;
       pendingState = normalizeState(JSON.parse(message.data));
       if (!pendingState.replay?.camera && !paused) state = pendingState;
-      if (pendingState.phase === 'track' && previousPhase !== 'track') fetchScene(token);
+      // The live server counts /scene versions: fetch whenever it changes (it is built while tracking starts).
+      // Servers without it: fetch when tracking starts.
+      const version = pendingState.scene_version;
+      if (Number.isFinite(version) ? version > 0 && version !== sceneVersion : pendingState.phase === 'track' && previousPhase !== 'track') {
+        sceneVersion = version; fetchScene(token);
+      }
       lastStateAt = performance.now(); receivedValidState = true;
       if (pendingState.source === 'synthetic' || pendingState.source === 'replay') mode = pendingState.source;
       const label = mode === 'synthetic' ? 'SIMULATION' : mode === 'replay' ? 'REPLAY' : 'CONNECTED';
