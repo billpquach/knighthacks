@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>X-Ray HUD</title>
+<!--
+  The glasses HUD as a web page: no Unity, no XREAL SDK. Open it in Chrome on the Beam Pro (or any device whose
+  screen goes to the glasses). Black is see-through on the glasses, so only the text and the x-ray view float.
+
+  Reads xray.live (core/xray/live.py) directly; it sends CORS on every endpoint:
+    /state?cloud=0   server-sent events, the newest state
+    /stream.mjpg     the x-ray view as video (falls back to polling /frame.jpg?after=SEQ, e.g. on replay_server.py)
+
+  URL options:
+    ?base=http://100.69.44.56:8080   the server (default: this page's own server if it has /state, else the Jetson)
+    &video=0                          text only (pure HUD)
+    &side=left                        put the video on the right instead of the left
+    &size=1.2                         scale all text
+    &speak=0                          no spoken replies
+  Tap once to go full screen, keep the screen awake and start listening; tap again to mute or unmute the mic.
+
+  Voice (Chrome's speech recognition; every phrase becomes POST /prompt, the same as typing in xray.live's console):
+    before tracking (--ask)   "find the red mug", "where is the remote"   -> a question for Qwen-3D
+                              "go" / "start tracking"                     -> Qwen-3D stops, YOLOE tracking starts
+    while tracking            "where is the ball", "which cup"            -> answered here, out loud, from the state
+                              "drive" / "fetch" / "go get it", "stop"     -> the rover (xray.live --rover)
+    any time                  "hide video", "show video", "mute", "unmute"
+  A leading "Jarvis" / "hey x-ray" is ignored, so either way works.
+  The mic needs a secure page: on http://, open chrome://flags/#unsafely-treat-insecure-origin-as-secure, add this
+  page's origin (e.g. http://100.69.44.56:8080), Enable, Relaunch.
+-->
+<style>
+  :root {
+    --green: #4CFF6A; --yellow: #FFD84C; --grey: #B4B4B4; --red: #FF5A5A; --cyan: #4CD2FF; --amber: #FFB040;
+    --scale: 1;
+  }
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; overflow: hidden; }
+  body {
+    font-family: ui-monospace, "Roboto Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace;
+    font-size: calc(22px * var(--scale)); line-height: 1.3;
+    -webkit-user-select: none; user-select: none; cursor: none;
+  }
+  #wrap { display: flex; height: 100%; gap: 2vw; padding: 2vh 2vw; box-sizing: border-box; }
+  #wrap.flip { flex-direction: row-reverse; }
+  #view { flex: 0 0 42vw; height: 100%; display: flex; align-items: center; justify-content: center; position: relative; }
+  #view img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  #view .none { color: var(--grey); font-size: 0.9em; position: absolute; }
+  #hud { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; justify-content: center; white-space: pre-wrap; }
+  .big { font-size: 1.5em; font-weight: 700; }
+  .huge { font-size: 2.2em; font-weight: 800; letter-spacing: 0.02em; }
+  .small { font-size: 0.8em; }
+  .row { margin: 0.1em 0; }
+  .gap { height: 0.6em; }
+  #banner {
+    position: fixed; left: 50%; transform: translateX(-50%); top: 5vh; text-align: center; pointer-events: none;
+    background: #000; padding: 0.25em 0.6em; border-radius: 0.2em; white-space: nowrap;
+    font-size: calc(64px * var(--scale)); font-weight: 900; line-height: 1.1; display: none;
+  }
+  #banner .sub { font-size: 0.45em; font-weight: 600; color: #fff; }
+  #hint { position: fixed; bottom: 1vh; right: 2vw; color: #555; font-size: 14px; }
+  #voice {
+    position: fixed; left: 2vw; right: 2vw; bottom: 3vh; font-size: calc(20px * var(--scale));
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none;
+  }
+  #voice .dot { display: inline-block; width: 0.6em; height: 0.6em; border-radius: 50%; margin-right: 0.4em; vertical-align: 0.05em; }
+  #voice .on { background: var(--red); animation: pulse 1.2s infinite; }
+  #voice .off { background: #444; }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+  .g { color: var(--green); } .y { color: var(--yellow); } .gr { color: var(--grey); }
+  .r { color: var(--red); } .c { color: var(--cyan); } .a { color: var(--amber); }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="view"><img id="frame" alt=""><span class="none" id="nocam">waiting for the x-ray view...</span></div>
+  <div id="hud"></div>
+</div>
+<div id="banner"></div>
+<div id="voice"></div>
+<div id="hint">tap for full screen + voice</div>
+
+<script>
+(() => {
+  const q = new URLSearchParams(location.search);
+  const JETSON = "http://100.69.44.56:8080";
+  const pageServer = /^https?:$/.test(location.protocol) ? location.origin : null;
+  let BASE = (q.get("base") || "").replace(/\/+$/, "");
+  let SHOW_VIDEO = q.get("video") !== "0";
+  let SPEAK = q.get("speak") !== "0";
+  const BANNER_SECONDS = 6, STALE_AFTER = 3, MAX_OBJECTS = 6;
+  if (q.get("size")) document.documentElement.style.setProperty("--scale", q.get("size"));
+  if (q.get("side") === "left") document.getElementById("wrap").classList.add("flip");
+
+  const hud = document.getElementById("hud");
+  const bannerEl = document.getElementById("banner");
+  const img = document.getElementById("frame");
+  const nocam = document.getElementById("nocam");
+  if (!SHOW_VIDEO) document.getElementById("view").style.display = "none";
+
+  // ---------------------------------------------------------------- state stream
+  let latest = null, latestAt = -1e9, es = null;
+  let primed = false, bannerUntil = 0;
+  const lastVerdicts = {};
+
+  function connectState() {
+    if (es) es.close();
+    es = new EventSource(BASE + "/state?cloud=0");
+    es.onmessage = (e) => {
+      let s;
+      try { s = JSON.parse(e.data); } catch { return; }
+      latest = s; latestAt = performance.now() / 1000;
+      watchVerdicts(s);
+      watchAnswers(s);
+    };
+    // EventSource reconnects by itself after an error; nothing else to do.
+  }
+
+  // ---------------------------------------------------------------- the x-ray view
+  let frameStatus = "waiting", lastFrameAt = -1e9, ageMs = -1, polling = false;
+
+  let videoStarted = false;
+  function startVideo() {
+    if (!SHOW_VIDEO || videoStarted) return;
+    videoStarted = true;
+    img.onload = () => { frameStatus = "ok"; lastFrameAt = performance.now() / 1000; nocam.style.display = "none"; };
+    img.onerror = () => { if (!polling) { polling = true; pollFrames(); } };
+    img.src = BASE + "/stream.mjpg";
+    // An MJPEG <img> fires onload only once in some browsers: count it as alive while the stream stays open.
+    setInterval(() => { if (!polling && img.complete && img.naturalWidth > 0) lastFrameAt = performance.now() / 1000; }, 1000);
+  }
+
+  async function pollFrames() {                       // replay_server.py has no /stream.mjpg: pull /frame.jpg instead
+    let seq = -1, url = null;
+    img.onload = null; img.onerror = null;
+    for (;;) {
+      const t0 = performance.now();
+      try {
+        const r = await fetch(BASE + "/frame.jpg" + (seq >= 0 ? "?after=" + seq : ""), { cache: "no-store" });
+        if (r.ok) {
+          const blob = await r.blob();
+          const next = URL.createObjectURL(blob);
+          img.src = next; if (url) URL.revokeObjectURL(url); url = next;
+          seq = parseInt(r.headers.get("X-Seq") || "-1", 10);
+          ageMs = parseInt(r.headers.get("X-Age-Ms") || "-1", 10);
+          frameStatus = "ok"; lastFrameAt = performance.now() / 1000; nocam.style.display = "none";
+        } else {
+          frameStatus = (r.status === 404 || r.status === 503) ? "nocamera" : "offline";
+          await sleep(1000);
+        }
+      } catch {
+        frameStatus = "offline"; seq = -1; await sleep(1000);
+      }
+      const wait = 1000 / 15 - (performance.now() - t0);
+      if (wait > 0) await sleep(wait);
+    }
+  }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // ---------------------------------------------------------------- the reveal banner
+  function watchVerdicts(s) {
+    const ball = s.ball;
+    if (!ball) { primed = true; return; }
+    const list = Array.isArray(ball.balls) && ball.balls.length ? ball.balls : [ball];
+    for (const b of list) {
+      const key = b.id || "ball";
+      const v = b.verdict || null;
+      const sig = v ? JSON.stringify(v) : null;
+      if (primed && v && sig !== lastVerdicts[key]) {
+        const right = v.right === true;
+        bannerEl.innerHTML =
+          `<span class="${right ? "g" : "r"}">REVEAL: ${right ? "RIGHT" : "WRONG"}</span><br>` +
+          `<span class="sub">${esc(cap(key))}: we said cup ${esc(v.believed)}, it was cup ${esc(v.actual)}` +
+          (v.cm != null ? ` (${Number(v.cm).toFixed(0)} cm)` : "") + `</span>`;
+        bannerUntil = performance.now() / 1000 + BANNER_SECONDS;
+        say(right ? `Right. The ${key} was under cup ${v.actual}.`
+                  : `Wrong. We said cup ${v.believed}, it was cup ${v.actual}.`);
+      }
+      lastVerdicts[key] = sig;
+    }
+    primed = true;
+  }
+
+  // ---------------------------------------------------------------- Qwen-3D answers, spoken as they arrive
+  let answersSeen = -1;
+  function watchAnswers(s) {
+    if (s.phase !== "ask") { answersSeen = -1; return; }
+    const objs = s.objects || [];
+    if (answersSeen >= 0 && objs.length > answersSeen) {
+      const a = objs[objs.length - 1];
+      const how = typeof a.score === "number" ? (a.score >= 0.6 ? "" : a.score >= 0.35 ? ", not sure" : ", a guess") : "";
+      say(`Found ${a.query || a.label || "it"}${how}.`);
+    }
+    answersSeen = objs.length;
+  }
+
+  // ---------------------------------------------------------------- voice: speech -> POST /prompt, answers out loud
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let rec = null, wantMic = false, micOn = false, interim = "", speaking = false;
+  let voiceNote = SR ? "" : "no speech recognition in this browser (use Chrome)";
+  let lastHeard = "", lastReply = "", lastReplyClass = "gr";
+  const DRIVE = ["go get it", "get it", "fetch", "drive", "go to it", "go to the target", "drive to the target"];
+  const STOP = ["stop driving", "stop", "halt"];
+
+  function say(text) {
+    lastReply = text; lastReplyClass = "c";
+    if (!SPEAK || !("speechSynthesis" in window)) return;
+    try {
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1.05;
+      u.onstart = () => { speaking = true; };
+      u.onend = u.onerror = () => { speaking = false; };
+      speechSynthesis.speak(u);
+    } catch {}
+  }
+
+  async function sendPrompt(text, label) {
+    lastReply = `→ ${label || text}`; lastReplyClass = "gr";
+    try {   // plain text: a "simple" request, no CORS preflight; xray.live takes the plain text as the prompt
+      const r = await fetch(BASE + "/prompt", { method: "POST", body: text });
+      const j = await r.json().catch(() => ({}));
+      lastReply = `→ ${label || text}  ` + (r.ok ? `(sent${j.phase ? ", " + j.phase : ""})` : `(server said ${r.status})`);
+      lastReplyClass = r.ok ? "g" : "r";
+      return r.ok;
+    } catch {
+      lastReply = `→ ${label || text}  (could not reach ${BASE})`; lastReplyClass = "r";
+      return false;
+    }
+  }
+
+  function ballAnswer(s, t) {               // "where is the (red) ball", "which cup": from the state, no round trip
+    const ball = s.ball;
+    if (!ball) return null;
+    const all = Array.isArray(ball.balls) && ball.balls.length ? ball.balls : [ball];
+    const b = all.find((b) => b.color && t.includes(String(b.color).toLowerCase())) || ball;
+    const name = b.id || "ball";
+    if (b.state === "INSIDE") return `The ${name} is under cup ${b.inside}.`;
+    if (b.state === "VISIBLE") return `I can see the ${name}. It is not under a cup.`;
+    if (b.state === "OCCLUDED") return `The ${name} is hidden, but it is not under a cup.`;
+    return `I lost the ${name}.`;
+  }
+
+  function cupAnswer(s, t) {                // "where is cup 2"
+    const m = t.match(/cup (\d+)/);
+    if (!m) return null;
+    const o = (s.objects || []).find((o) => String(o.id) === m[1]);
+    if (!o) return `I don't know cup ${m[1]}.`;
+    const inside = (o.balls_inside || []).length ? `, with the ${o.balls_inside.join(" and the ")} inside` : "";
+    return `Cup ${o.id} is ${String(o.state || "unknown").toLowerCase().replace(/_/g, " ")}${inside}.`;
+  }
+
+  function handleUtterance(raw) {
+    let t = raw.toLowerCase().trim().replace(/[.!?,]+$/g, "");
+    t = t.replace(/^(hey |ok |okay )?(jarvis|x-ray|xray|x ray)[,\s]*/, "").trim();
+    if (!t) return;
+    lastHeard = t;
+    const s = latest || {};
+    const phase = s.phase || "";
+
+    if (/^(hide|turn off) (the )?(video|camera|view)$/.test(t)) { setVideo(false); return say("Video off."); }
+    if (/^(show|turn on) (the )?(video|camera|view)$/.test(t)) { setVideo(true); return say("Video on."); }
+    if (/^(mute|be quiet|quiet|stop talking)$/.test(t)) { say("Muted."); SPEAK = false; return; }
+    if (/^(unmute|talk|speak|talk to me)$/.test(t)) { SPEAK = true; return say("I'm back."); }
+
+    if (/^(go|start|track|start tracking|begin)$/.test(t)) return sendPrompt("go", "go: start tracking");
+    if (STOP.includes(t)) return sendPrompt("stop", "stop the rover");
+    if (DRIVE.some((w) => t === w || t.startsWith(w + " "))) return sendPrompt("drive", "drive the rover to the target");
+
+    if (phase === "track" || phase === "starting") {
+      if (/\b(where|which|what)\b/.test(t) && /\bball\b/.test(t)) return say(ballAnswer(s, t) || "No ball in this game.");
+      if (/\bcup \d+\b/.test(t)) return say(cupAnswer(s, t));
+      if (/\b(where|which)\b/.test(t) && /\bcup\b/.test(t)) return say(ballAnswer(s, t) || "No ball in this game.");
+      lastReply = `"${t}": questions go to Qwen-3D before tracking (say "where is the ball", "drive", "stop")`;
+      lastReplyClass = "y";
+      return;
+    }
+    // scan or ask: a question for Qwen-3D (queued during the scan, asked as soon as Qwen-3D is ready).
+    // "find the red mug" -> "the red mug": the grounding model wants the thing, not the command.
+    const thing = t.replace(/^(please |can you |could you )?(find|locate|show me|where is|where's|where are|look for|highlight|point to)\s+/, "") || t;
+    sendPrompt(thing, `ask Qwen-3D: "${thing}"`);
+  }
+
+  function startMic() {
+    if (!SR) return;
+    if (!rec) {
+      rec = new SR();
+      rec.lang = q.get("lang") || "en-US";
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.onstart = () => { micOn = true; voiceNote = ""; };
+      rec.onresult = (e) => {
+        let partial = "";
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const r = e.results[i];
+          if (r.isFinal) { if (!speaking) handleUtterance(r[0].transcript); }
+          else partial += r[0].transcript;
+        }
+        interim = speaking ? "" : partial;
+      };
+      rec.onerror = (e) => {
+        if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+          wantMic = false;
+          voiceNote = window.isSecureContext ? "microphone blocked: allow it in Chrome's site settings"
+                                             : "mic needs a secure page: chrome://flags → insecure origins treated as secure → add " + location.origin;
+        } else if (e.error !== "no-speech" && e.error !== "aborted") {
+          voiceNote = "speech: " + e.error;
+        }
+      };
+      rec.onend = () => {                   // Chrome stops after a pause: keep listening while the mic is wanted
+        micOn = false; interim = "";
+        if (wantMic) setTimeout(() => { try { rec.start(); } catch {} }, 300);
+      };
+    }
+    wantMic = true;
+    try { rec.start(); } catch {}
+  }
+  function stopMic() { wantMic = false; try { rec && rec.stop(); } catch {} }
+
+  function setVideo(on) {
+    SHOW_VIDEO = on;
+    document.getElementById("view").style.display = on ? "" : "none";
+    if (on) startVideo();
+  }
+
+  function renderVoice() {
+    const el = document.getElementById("voice");
+    let h = `<span class="dot ${micOn ? "on" : "off"}"></span>`;
+    if (voiceNote) h += `<span class="y">${esc(voiceNote)}</span>`;
+    else if (interim) h += `<span>${esc(interim)}</span>`;
+    else if (micOn) h += `<span class="gr">listening${lastHeard ? ` · heard "${esc(lastHeard)}"` : ""}</span>`;
+    else h += `<span class="gr">${SR ? "mic off · tap to talk" : ""}</span>`;
+    if (lastReply) h += `   <span class="${lastReplyClass}">${esc(lastReply)}</span>`;
+    el.innerHTML = h;
+  }
+
+  // ---------------------------------------------------------------- drawing, 10 times a second
+  function render() {
+    const now = performance.now() / 1000;
+    const live = latest && now - latestAt < STALE_AFTER;
+    const s = latest;
+    let h = "";
+
+    // status line
+    h += `<div class="row">`;
+    h += live ? `<span class="g">LIVE</span>` : `<span class="r">NO SIGNAL</span>` +
+         (latest ? ` <span class="gr">(${Math.round(now - latestAt)} s)</span>` : "");
+    if (s && typeof s.fps === "number") h += `  <span class="gr">${s.fps.toFixed(0)} fps</span>`;
+    if (SHOW_VIDEO) {
+      if (frameStatus === "nocamera") h += `  <span class="gr">NO CAMERA</span>`;
+      else if (frameStatus === "offline") h += `  <span class="r">NO FRAMES</span>`;
+      else if (frameStatus === "ok" && polling && now - lastFrameAt > 3) h += `  <span class="y">FRAMES STALLED</span>`;
+      else if (frameStatus === "ok" && ageMs >= 0) h += `  <span class="gr">cam ${ageMs} ms</span>`;
+    }
+    h += `</div><div class="gap"></div>`;
+
+    if (!s) {
+      h += `<div class="big gr">Connecting to ${esc(BASE)}</div>`;
+    } else if (s.phase === "scan") {
+      h += `<div class="huge c">SCANNING</div><div>Walk slowly around the table</div>`;
+    } else if (s.phase === "ask") {
+      const qw = s.qwen || {};
+      h += `<div class="big c">ASK QWEN-3D</div>`;
+      h += `<div class="${qw.thinking ? "y" : qw.ready ? "g" : "gr"}">${esc(qw.status || "Qwen-3D")}</div>`;
+      h += answers(s, 4);
+    } else if (s.phase === "starting") {
+      h += `<div class="big c">STARTING TRACKING</div><div>Qwen-3D done, loading YOLOE...</div>` + answers(s, 1);
+    } else {
+      h += target(s) + objects(s) + otherBalls(s) + rover(s);
+    }
+    hud.innerHTML = h;
+    renderVoice();
+    bannerEl.style.display = now < bannerUntil ? "block" : "none";
+  }
+
+  function target(s) {
+    const ball = s.ball;
+    if (ball) {
+      const name = cap(ball.color || "") + " ball", st = ball.state || "?";
+      if (st === "INSIDE")
+        return `<div class="huge y">${esc(name)} → CUP ${esc(ball.inside ?? "?")}</div><div class="gap"></div>`;
+      return `<div class="big ${colour(st)}">${esc(name)}: ${words(st)}</div><div class="gap"></div>`;
+    }
+    if (s.target_id == null) return "";
+    const o = (s.objects || []).find((o) => String(o.id) === String(s.target_id));
+    if (!o) return "";
+    return `<div class="big"><span class="a">TARGET: ${esc(o.label || "object")} ${esc(o.id)}</span>  ` +
+           `<span class="${colour(o.state)}">${words(o.state)}</span></div><div class="gap"></div>`;
+  }
+
+  function objects(s) {
+    const objs = s.objects || [];
+    let h = "", n = 0;
+    for (const o of objs) {
+      if (n++ >= MAX_OBJECTS) { h += `<div class="gr">  ...</div>`; break; }
+      const st = o.state || "?";
+      const isT = o.target === true || (s.target_id != null && String(o.id) === String(s.target_id));
+      let line = `${isT ? `<span class="a">▶ </span>` : "  "}<span class="${colour(st)}">${esc(o.label || "object")} ${esc(o.id)}  ${words(st)}`;
+      if (st !== "VISIBLE" && typeof o.since_seen_s === "number") line += ` ${o.since_seen_s.toFixed(0)}s`;
+      line += `</span>`;
+      if (Array.isArray(o.balls_inside) && o.balls_inside.length) line += `  <span class="c">(${o.balls_inside.map(esc).join(" + ")} inside)</span>`;
+      h += `<div class="row">${line}</div>`;
+    }
+    return h;
+  }
+
+  function otherBalls(s) {
+    const ball = s.ball;
+    if (!ball || !Array.isArray(ball.balls)) return "";
+    let h = "";
+    for (const b of ball.balls) {
+      if (b.id === ball.id) continue;
+      const st = b.state || "?";
+      h += `<div class="row small gr">  ${esc(b.id || "ball")}: ${st === "INSIDE" ? "under cup " + esc(b.inside ?? "?") : words(st)}</div>`;
+    }
+    return h ? `<div class="gap"></div>` + h : "";
+  }
+
+  function rover(s) {                       // xray.live --rover: msg.drive = {state, target_id, ...}
+    const d = s.drive;
+    if (!d || !d.state || d.state === "idle") return "";
+    const cls = d.state === "arrived" ? "g" : d.state === "lost" ? "r" : "a";
+    let line = `ROVER: ${esc(String(d.state).toUpperCase())}`;
+    if (d.target_id != null) line += ` → ${esc(d.target_id)}`;
+    if (typeof d.distance_m === "number") line += `  ${(d.distance_m * 100).toFixed(0)} cm`;
+    return `<div class="gap"></div><div class="big ${cls}">${line}</div>`;
+  }
+
+  function answers(s, max) {
+    const objs = s.objects || [];
+    let h = `<div class="gap"></div>`;
+    for (const o of objs.slice(Math.max(0, objs.length - max))) {
+      const t = o.target === true;
+      h += `<div class="row ${t ? "a" : "gr"}">${t ? "▶ TARGET: " : "  "}"${esc(o.query || o.label || "answer")}"` +
+           (typeof o.score === "number" ? `  ${o.score.toFixed(2)}` : "") + (o.band ? ` (${esc(o.band)})` : "") + `</div>`;
+    }
+    return h;
+  }
+
+  const colour = (st) => ({ VISIBLE: "g", OCCLUDED: "y", OUT_OF_VIEW: "gr", LOST: "r", INSIDE: "c" })[st] || "gr";
+  const words = (st) => (st === "OUT_OF_VIEW" ? "OUT OF VIEW" : esc(st));
+  const cap = (x) => (x ? String(x)[0].toUpperCase() + String(x).slice(1) : "");
+  const esc = (x) => String(x ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+
+  // ---------------------------------------------------------------- full screen, screen awake
+  let wakeLock = null;
+  let tapped = false;
+  document.addEventListener("click", async () => {
+    // The first tap: full screen, screen awake, mic on (browsers allow these only after a tap). Later taps: mic on/off.
+    if (!tapped) {
+      tapped = true;
+      startMic();
+      say("X-ray online.");
+    } else if (wantMic) stopMic();
+    else startMic();
+    try { if (!document.fullscreenElement) await document.documentElement.requestFullscreen(); } catch {}
+    try { if ("wakeLock" in navigator && !wakeLock) wakeLock = await navigator.wakeLock.request("screen"); } catch {}
+    document.getElementById("hint").style.display = "none";
+  });
+  window.__hud = { handleUtterance, state: () => latest, reply: () => lastReply };   // (for tests)
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") wakeLock = null; });
+
+  // ---------------------------------------------------------------- pick the server, then start
+  async function hasState(url) {
+    try {
+      const ctl = new AbortController(); setTimeout(() => ctl.abort(), 1500);
+      const r = await fetch(url + "/viewer-info", { signal: ctl.signal, cache: "no-store" });
+      return r.ok;
+    } catch { return false; }
+  }
+  (async () => {
+    if (!BASE) BASE = pageServer && (await hasState(pageServer)) ? pageServer : JETSON;
+    connectState();
+    startVideo();
+    setInterval(render, 100);
+    render();
+  })();
+})();
+</script>
+</body>
+</html>
