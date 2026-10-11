@@ -17,7 +17,7 @@ is connected. See the viewer README for the stream and point-cloud contract.
 
 ## Jetson pipeline
 
-From `core/`, with the phone streaming over USB in Record3D:
+From `core/`, with the phone streaming over USB in Record3D at **15 fps** (faster than the Jetson tracks, frames queue up and the view falls further behind every second):
 
 ```bash
 python -m xray.live --scan-seconds 20 --ball --video     # scan the table, then the shell game

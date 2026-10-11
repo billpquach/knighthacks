@@ -30,6 +30,9 @@ Separate threads, so the frame rate is set by the slowest stage, not by all of t
 tracking, the game and the x-ray view; JPEG and serving (always the newest frame, so the feed never lags); the log,
 video and recording (live, a frame they can't keep up with is skipped there, never in the feed).
 
+Record3D at 15 fps (Settings in the app): faster than the Jetson processes, the frames queue up before they reach
+this program and the view falls further behind every second (60 fps: about 3 s more delay every second).
+
 The scan and the tracking must share the phone's ARKit session (don't restart Record3D in between): live frames are
 put in the scan's world with its meta.json world_from_arkit. --results picks the target from Qwen-3D's first answer
 (python -m ground3d.ground --out); --ball plays the shell game (the yellow ball's cup is the target).
@@ -75,6 +78,9 @@ CYAN = (255, 220, 0)
 AMBER = (40, 190, 255)
 PHONE_TIP = ("Keep Record3D open and streaming, and the iPhone awake (Settings > Display & Brightness > Auto-Lock > "
              "Never); don't restart Record3D between the scan and tracking")
+# Record3D's frame rate must not exceed what the Jetson processes (about 15 a second while tracking): frames it
+# can't keep up with queue up before they reach us (in the USB stream and record3d's decoder), and the view falls
+# further behind every second. Set the app to 15 fps.
 
 
 # ---------------------------------------------------------------------------------------- serving
@@ -751,7 +757,8 @@ def main(argv=None):
     objects, table = tk.scan_objects(scan, args.prompt, use_detector=False)
     print(f"scene: {len(objects)} objects, table at {table if table is None else round(table, 3)} m: "
           + ", ".join(f"{o['label']} at {tk.r4(o['position'])}" for o in objects), flush=True)
-    point, query = (answers[-1]["point"], answers[-1]["query"]) if answers else \
+    pick = ([a for a in answers if a.get("band") == "high"] or answers)[-1:]   # the last confident answer
+    point, query = (pick[0]["point"], pick[0]["query"]) if pick else \
         qwen_target(args.results) if args.results else (None, None)
 
     def new_game():                                     # the tracker (and the game) as the scan left them
