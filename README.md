@@ -47,6 +47,12 @@ answered in seconds. Between judges: Ctrl+C, start it again, reset the props whi
 python -m xray.live --wait --ask --ball --rover --rover-scan --video --out runs/judge1 2>&1 | tee -i judge1.log
 ```
 
+Voice: the dashboard's command bar sends typed commands, and with the mic on, anything said after "hey rover"
+("hey rover, the cup next to the green ball", "hey rover, go", "hey rover, drive to cup 2", "hey rover, stop", and
+"hey rover, scan" with `--wait`). It uses the browser's speech recognition (Chrome; it needs internet), and browsers
+allow the microphone only on https or localhost, so open the dashboard through a tunnel from the laptop:
+`ssh -L 8080:localhost:8080 knighthacks@<jetson>`, then http://localhost:8080.
+
 To work from a recording instead of the phone:
 
 ```bash

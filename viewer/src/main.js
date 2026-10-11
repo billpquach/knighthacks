@@ -1,11 +1,12 @@
-import { createIcons, ScanEye, Radio, Radar, Maximize, Columns2, PictureInPicture2, Camera, Pause, Play, Navigation, Scan, VideoOff, X, Plug, Search, Cpu, ChevronDown, Crosshair, PanelRightClose, PanelRightOpen } from 'lucide';
+import { createIcons, ScanEye, Radio, Radar, Maximize, Columns2, PictureInPicture2, Camera, Pause, Play, Navigation, Scan, VideoOff, X, Plug, Search, Cpu, ChevronDown, Crosshair, PanelRightClose, PanelRightOpen, Mic, MicOff, Send } from 'lucide';
 import { RobotScene } from './scene.js';
 import { normalizeState, normalizeScene, resolveTarget, displayName, distance, sourceUrl, cameraPose, memoryAgeLabel } from './state.js';
 import './style.css';
 import { ResourcePanel, metricsUrl } from './resources.js';
+import { Voice } from './voice.js';
 
 const $ = id => document.getElementById(id);
-const icons = { ScanEye, Radio, Radar, Maximize, Columns2, PictureInPicture2, Camera, Pause, Play, Navigation, Scan, VideoOff, X, Plug, Search, Cpu, ChevronDown, Crosshair, PanelRightClose, PanelRightOpen };
+const icons = { ScanEye, Radio, Radar, Maximize, Columns2, PictureInPicture2, Camera, Pause, Play, Navigation, Scan, VideoOff, X, Plug, Search, Cpu, ChevronDown, Crosshair, PanelRightClose, PanelRightOpen, Mic, MicOff, Send };
 const drawIcons = () => createIcons({ icons });
 drawIcons();
 const resources = new ResourcePanel($('resources'));
@@ -52,6 +53,45 @@ document.querySelectorAll('[data-filter]').forEach(button => button.onclick = ()
   renderMemory();
 });
 $('follow-target').onclick = () => { selectedId = null; display(true); };
+
+// Commands for the robot (POST /prompt, like the Jetson's console): typed, or spoken after "hey rover".
+let voiceNote = '', voiceNoteAt = 0;
+function voiceStatus(text, kind = '') {
+  voiceNote = text; voiceNoteAt = Date.now();
+  $('voice-status').textContent = text;
+  $('voice-status').dataset.kind = kind;
+}
+async function sendCommand(text) {
+  text = text.trim();
+  if (!text) return;
+  if (!source) { voiceStatus(`Not connected: "${text}" not sent`, 'error'); return; }
+  voiceStatus(`\u2192 "${text}"`, 'sent');
+  try {
+    const response = await fetch(`${source}/prompt`, { method: 'POST', body: text, signal: AbortSignal.timeout(4000) });
+    if (!response.ok) throw new Error(String(response.status));
+  } catch { voiceStatus(`Couldn't send "${text}": is the robot connected?`, 'error'); }
+}
+const VOICE_STATES = {
+  off: 'Voice off', listening: 'Listening for "hey rover"', armed: 'Yes? Say the command',
+  network: 'Speech recognition needs internet (Chrome sends audio to Google): retrying',
+  blocked: 'Microphone blocked: allow it in the address bar, then click the mic again',
+  insecure: 'The mic needs https or localhost: ssh -L 8080:localhost:8080 knighthacks@<jetson>, then http://localhost:8080',
+  unsupported: 'No speech recognition in this browser: use Chrome (or type the command)',
+};
+const voice = new Voice({
+  onCommand: text => sendCommand(text),
+  onHeard: (text, final) => { if (!final || Date.now() - voiceNoteAt > 300) voiceStatus(final ? `Heard "${text}"` : `\u2026 ${text}`, final ? 'heard' : 'interim'); },
+  onState: state => {
+    $('voice').dataset.state = state;
+    const on = state === 'listening' || state === 'armed' || state === 'network';
+    $('voice-toggle').setAttribute('aria-pressed', String(on));
+    $('voice-toggle').innerHTML = `<i data-lucide="${on ? 'mic' : 'mic-off'}"></i>`;
+    drawIcons();
+    voiceStatus(VOICE_STATES[state] || state, state === 'blocked' || state === 'insecure' || state === 'unsupported' ? 'error' : '');
+  },
+});
+$('voice-toggle').onclick = () => (voice.enabled ? voice.stop() : voice.start());
+$('command-form').onsubmit = event => { event.preventDefault(); sendCommand($('command-input').value); $('command-input').value = ''; };
 
 function projection(view) {
   $('robot-view').parentElement.style.setProperty('--selected-index', view === 'robot' ? 0 : 1);
@@ -162,9 +202,22 @@ function decisionCard() {
   }));
 }
 
+function robotNote() {           // what the robot is doing about the last command, under the command bar
+  if (Date.now() - voiceNoteAt < 2500) return;
+  const q = state?.qwen, drive = state?.drive;
+  let note = '';
+  if (Number.isFinite(q?.driving_in)) note = `Driving to Qwen-3D's answer in ${q.driving_in.toFixed(1)} s: say "hey rover, stop" to cancel`;
+  else if (q?.thinking) note = `Qwen-3D thinking: "${q.thinking}"`;
+  else if (drive && drive.state && !['idle', 'stopped'].includes(drive.state)) note = `Rover ${drive.state}${drive.target_id != null ? ` to ${drive.target_id}` : ''}`;
+  else if (state?.phase === 'loading') note = `Loading: ${(state.loading || []).join(', ')}`;
+  else if (state?.phase === 'ready') note = 'Ready: say "hey rover, scan" (or press Enter on the Jetson)';
+  if (note && $('voice-status').textContent !== note) { $('voice-status').textContent = note; $('voice-status').dataset.kind = 'robot'; }
+}
+
 function display(force = false) {
   if (!state || (paused && !force)) return;
   decisionCard();
+  robotNote();
   if (selectedId !== null && ![...state.objects, ...state.balls].some(object => String(object.id) === selectedId)) selectedId = null;
   target = resolveTarget(state, selectedId);
   const geometry = scene?.update(state, target);

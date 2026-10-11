@@ -15,6 +15,13 @@
       </header>
       <section class="overview" aria-label="Observation overview">
         <div><div class="eyebrow">WORKSPACE <span>/</span> <span id="phase">WAITING</span></div><h1>Observation</h1></div>
+        <div id="voice" class="voice" data-state="off">
+          <button id="voice-toggle" class="icon-button" title="Listen for &quot;hey rover&quot;" aria-label="Listen for hey rover" aria-pressed="false"><i data-lucide="mic-off"></i></button>
+          <div class="voice-body">
+            <form id="command-form" class="command-form"><input id="command-input" type="text" placeholder="Say &quot;hey rover, ...&quot; or type a command" autocomplete="off" aria-label="Command for the robot" /><button class="icon-button" type="submit" title="Send command" aria-label="Send command"><i data-lucide="send"></i></button></form>
+            <div id="voice-status" class="voice-status" role="status">Voice off: click the mic, then say "hey rover, the cup next to the green ball"</div>
+          </div>
+        </div>
         <div class="observation-counts"><div><strong id="observed-count">--</strong><span>Observed</span></div><div><strong id="unseen-count">--</strong><span>Unseen</span></div></div>
         <button id="inspector-toggle" class="icon-button" title="Hide object memory" aria-label="Hide object memory" aria-expanded="true" aria-controls="memory-panel"><i data-lucide="panel-right-close"></i></button>
       </section>
