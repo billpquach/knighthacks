@@ -189,7 +189,7 @@ function decisionCard() {
   card.hidden = false;
   card.querySelector('.qc-query').textContent = `"${a.query}"`;
   card.querySelector('.qc-pick').textContent = `\u2192 ${a.target || 'object'}  ${Math.round(100 * a.score)}%`;
-  const info = [`${Number(a.seconds).toFixed(1)} s on the Jetson`, '8-bit 3B VLM'];
+  const info = [`${Number(a.seconds).toFixed(1)} s on the Jetson`, `${a.bits || 8}-bit 3B VLM`];
   if (Number.isFinite(a.ram_gb)) info.push(`${a.ram_gb.toFixed(1)} GB`);
   if (Number.isFinite(a.tokens)) info.push(`${a.tokens} tokens`);
   card.querySelector('.qc-info').textContent = info.join(' \u00b7 ');
@@ -204,7 +204,7 @@ function decisionCard() {
 
 function robotNote() {           // what the robot is doing about the last command, under the command bar
   if (Date.now() - voiceNoteAt < 2500) return;
-  const q = state?.qwen, drive = state?.drive;
+  const q = state?.phase === 'ask' ? state.qwen : null, drive = state?.drive;
   let note = '';
   if (Number.isFinite(q?.driving_in)) note = `Driving to Qwen-3D's answer in ${q.driving_in.toFixed(1)} s: say "hey rover, stop" to cancel`;
   else if (q?.thinking) note = `Qwen-3D thinking: "${q.thinking}"`;

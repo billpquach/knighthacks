@@ -16,6 +16,43 @@ The built viewer is committed in `viewer/dist/`, so `git pull` brings the curren
 The local server supplies an explicitly labeled simulation until a Jetson URL
 is connected. See the viewer README for the stream and point-cloud contract.
 
+## Judging runbook
+
+Once, before the first judges:
+1. Reboot the Jetson, then `sudo systemctl isolate multi-user.target && sudo jetson_clocks` (desktop off: Qwen-3D needs
+   the memory). `free -h` should show about 1 GB used.
+2. Rover: a fresh AA pack; the Uno's and the phone's USB in the Jetson's USB-A ports (not USB-C); the phone on its
+   mount, Record3D streaming over USB at 15 fps, Auto-Lock off.
+3. Laptop: `ssh -L 8080:localhost:8080 knighthacks@<jetson-ip>`, then http://localhost:8080 in Chrome (microphone
+   allowed, the headset as input, internet on for speech recognition).
+
+Each judging slot (a new `--out` each time; without the box engine, leave out `--prompt`):
+
+```bash
+cd ~/knighthacks26/core
+python -m xray.live --wait --ask --ball --rover --rover-scan --rover-size FRONT WIDTH --prompt "solo cup,ball,box" \
+    --video --out runs/judge1 2>&1 | tee -i judge1.log
+```
+
+Reset the props while it loads (~2 min) until the camera view says READY, then:
+1. "hey rover, scan" (or Enter): the rover scans by itself, stopping for each view (~25 s); the map fills in.
+2. "hey rover, the cup next to the box": Qwen-3D's confidence sweep, its runners-up, the decision card.
+3. "hey rover, go": Qwen-3D frees its memory, YOLOE tracking starts (TensorRT, ~15 fps).
+4. Shuffle the cups, or hide the ball under one: the x-ray twins follow, "remembered" when out of sight.
+5. "hey rover, drive": it goes around the other cups to the one Qwen-3D picked and touches it.
+   One sentence does 2-5 too: "hey rover, drive to the cup next to the box" (3.5 s to say "stop").
+
+Ctrl+C ends the slot; start the next one right away.
+
+| If | Do |
+|---|---|
+| "Qwen-3D stopped while loading ... out of memory" | `pkill -f ground3d.ground; pkill -f xray.live`, `free -h`; reboot if more than 1.5 GB is used |
+| "no frame from the phone" | Record3D open and streaming, the phone awake; start again |
+| The wheels hum without moving | fresh batteries, or `--rover-power 125 130 100` |
+| Qwen-3D picks the wrong cup | "stop" during the countdown; ask with a landmark (the box, a coloured ball) |
+| Voice doesn't hear | the status line under the command bar shows what it heard; type the command there instead |
+| The rover must stop now | "stop" or Ctrl+C (the Arduino also stops the motors 0.3 s after the Jetson goes quiet) |
+
 ## Jetson pipeline
 
 From `core/`, with the phone streaming over USB in Record3D at **15 fps** (faster than the Jetson tracks, frames queue up and the view falls further behind every second):
